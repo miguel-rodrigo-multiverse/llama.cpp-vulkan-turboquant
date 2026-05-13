@@ -46,7 +46,7 @@
 #define LLAMA_SESSION_VERSION 9
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 2
+#define LLAMA_STATE_SEQ_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -190,6 +190,21 @@ extern "C" {
     };
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
+
+    enum llama_kv_cache_codec {
+        LLAMA_KV_CACHE_CODEC_NONE       = 0,
+        LLAMA_KV_CACHE_CODEC_TURBOQUANT = 1,
+    };
+
+    LLAMA_API const char * llama_kv_cache_codec_name(enum llama_kv_cache_codec codec);
+
+    enum llama_turboquant_runtime {
+        LLAMA_TURBOQUANT_RUNTIME_AUTO   = 0,
+        LLAMA_TURBOQUANT_RUNTIME_HIP    = 1,
+        LLAMA_TURBOQUANT_RUNTIME_VULKAN = 2,
+    };
+
+    LLAMA_API const char * llama_turboquant_runtime_name(enum llama_turboquant_runtime runtime);
 
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
@@ -356,6 +371,10 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        enum llama_kv_cache_codec kv_cache_codec;               // KV cache codec
+        enum llama_turboquant_runtime turboquant_runtime;       // backend runtime used by TurboQuant kernels
+        uint32_t turboquant_group_size;                         // PolarQuant block/group size
+        uint32_t turboquant_residual_bits;                      // residual correction bit budget
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -374,6 +393,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool turboquant_qjl;             // enable QJL residual path
+        bool turboquant_allow_fallback;  // permit fallback to baseline KV layout while kernels are incomplete
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -405,6 +426,7 @@ extern "C" {
         bool pure;                                                  // quantize all tensors to the default type
         bool keep_split;                                            // quantize to the same number of shards
         bool dry_run;                                               // calculate and show the final quantization size without performing quantization
+        // TODO(miguel): see if these 4 below are incompatible with my TQ implementation:
         const struct llama_model_imatrix_data * imatrix;            // pointer to importance matrix data
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
@@ -510,6 +532,27 @@ extern "C" {
 
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
+
+    enum llama_params_fit_status {
+        LLAMA_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
+        LLAMA_PARAMS_FIT_STATUS_FAILURE = 1, // could not find allocations that are projected to fit
+        LLAMA_PARAMS_FIT_STATUS_ERROR   = 2, // a hard error occurred, e.g. because no model could be found at the specified path
+    };
+
+    // fits mparams and cparams to free device memory (assumes system memory is unlimited)
+    //   - returns true if the parameters could be successfully modified to fit device memory
+    //   - this function is NOT thread safe because it modifies the global llama logger state
+    //   - only parameters that have the same value as in llama_default_model_params are modified
+    //     with the exception of the context size which is modified if and only if equal to 0
+    LLAMA_API enum llama_params_fit_status llama_params_fit(
+                                   const char   * path_model,
+                    struct llama_model_params   * mparams,
+                    struct llama_context_params * cparams,
+                                          float * tensor_split,          // writable buffer for tensor split, needs at least llama_max_devices elements
+        struct llama_model_tensor_buft_override * tensor_buft_overrides, // writable buffer for overrides, needs at least llama_max_tensor_buft_overrides elements
+                                         size_t * margins,               // margins of memory to leave per device in bytes
+                                       uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
+                            enum ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
     LLAMA_API int64_t llama_time_us(void);
 
@@ -1529,6 +1572,9 @@ extern "C" {
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
+
+    // print a breakdown of per-device memory use via LLAMA_LOG:
+    LLAMA_API void llama_memory_breakdown_print(const struct llama_context * ctx);
 
     //
     // training
