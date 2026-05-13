@@ -27,6 +27,12 @@
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
 
+// TODO(miguel): remove this
+#define print_build_info() do {                                                                     \
+    fprintf(stderr, "%s: build = %d (%s)\n",      __func__, LLAMA_BUILD_NUMBER, LLAMA_COMMIT);      \
+    fprintf(stderr, "%s: built with %s for %s\n", __func__, LLAMA_COMPILER, LLAMA_BUILD_TARGET);    \
+} while(0)
+
 struct common_time_meas {
     common_time_meas(int64_t & t_acc, bool disable = false);
     ~common_time_meas();
@@ -47,6 +53,14 @@ struct common_adapter_lora_info {
 };
 
 using llama_tokens = std::vector<llama_token>;
+
+// build info
+extern int LLAMA_BUILD_NUMBER;
+extern const char * LLAMA_COMMIT;
+extern const char * LLAMA_COMPILER;
+extern const char * LLAMA_BUILD_TARGET;
+
+const static std::string build_info("b" + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT);
 
 struct common_control_vector_load_info;
 
@@ -549,6 +563,12 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    llama_kv_cache_codec kv_cache_codec = LLAMA_KV_CACHE_CODEC_NONE;
+    llama_turboquant_runtime turboquant_runtime = LLAMA_TURBOQUANT_RUNTIME_AUTO;
+    uint32_t turboquant_group_size = 64;
+    uint32_t turboquant_residual_bits = 1;
+    bool turboquant_qjl = true;
+    bool turboquant_allow_fallback = true;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

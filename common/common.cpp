@@ -1517,6 +1517,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.kv_cache_codec = params.kv_cache_codec;
+    cparams.turboquant_runtime = params.turboquant_runtime;
+    cparams.turboquant_group_size = params.turboquant_group_size;
+    cparams.turboquant_residual_bits = params.turboquant_residual_bits;
+    cparams.turboquant_qjl = params.turboquant_qjl;
+    cparams.turboquant_allow_fallback = params.turboquant_allow_fallback;
 
     return cparams;
 }

@@ -386,6 +386,7 @@ static handle_model_result common_params_handle_model(struct common_params_model
     return result;
 }
 
+// TODO(miguel): Make sure we don't need new KV cache types
 const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_F32,
     GGML_TYPE_F16,
@@ -413,6 +414,37 @@ static std::string get_all_kv_cache_types() {
         msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
     }
     return msg.str();
+}
+
+static llama_kv_cache_codec kv_cache_codec_from_str(const std::string & s) {
+    if (s == "none") {
+        return LLAMA_KV_CACHE_CODEC_NONE;
+    }
+    if (s == "turboquant") {
+        return LLAMA_KV_CACHE_CODEC_TURBOQUANT;
+    }
+    throw std::runtime_error("Unsupported KV cache codec: " + s);
+}
+
+static std::string get_all_kv_cache_codecs() {
+    return "none, turboquant";
+}
+
+static llama_turboquant_runtime turboquant_runtime_from_str(const std::string & s) {
+    if (s == "auto") {
+        return LLAMA_TURBOQUANT_RUNTIME_AUTO;
+    }
+    if (s == "hip") {
+        return LLAMA_TURBOQUANT_RUNTIME_HIP;
+    }
+    if (s == "vulkan") {
+        return LLAMA_TURBOQUANT_RUNTIME_VULKAN;
+    }
+    throw std::runtime_error("Unsupported TurboQuant runtime: " + s);
+}
+
+static std::string get_all_turboquant_runtimes() {
+    return "auto, hip, vulkan";
 }
 
 static bool parse_bool_value(const std::string & value) {
@@ -2049,6 +2081,62 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--kv-codec"}, "CODEC",
+        string_format(
+            "KV cache codec\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_codecs().c_str(),
+            llama_kv_cache_codec_name(params.kv_cache_codec)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.kv_cache_codec = kv_cache_codec_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_KV_CODEC"));
+    add_opt(common_arg(
+        {"--kv-tq-runtime"}, "RUNTIME",
+        string_format(
+            "TurboQuant runtime backend\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_turboquant_runtimes().c_str(),
+            llama_turboquant_runtime_name(params.turboquant_runtime)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.turboquant_runtime = turboquant_runtime_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_KV_TQ_RUNTIME"));
+    add_opt(common_arg(
+        {"--kv-tq-group-size"}, "N",
+        string_format("TurboQuant PolarQuant group size (default: %u)", params.turboquant_group_size),
+        [](common_params & params, int value) {
+            params.turboquant_group_size = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TQ_GROUP_SIZE"));
+    add_opt(common_arg(
+        {"--kv-tq-residual-bits"}, "N",
+        string_format("TurboQuant residual correction bit budget (default: %u)", params.turboquant_residual_bits),
+        [](common_params & params, int value) {
+            params.turboquant_residual_bits = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TQ_RESIDUAL_BITS"));
+    add_opt(common_arg(
+        {"--kv-tq-qjl"},
+        {"--no-kv-tq-qjl"},
+        string_format("whether to enable TurboQuant QJL residual correction (default: %s)", params.turboquant_qjl ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.turboquant_qjl = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TQ_QJL"));
+    add_opt(common_arg(
+        {"--kv-tq-fallback"},
+        {"--no-kv-tq-fallback"},
+        string_format("whether TurboQuant may fall back to the baseline KV layout while kernels are incomplete (default: %s)", params.turboquant_allow_fallback ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.turboquant_allow_fallback = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TQ_FALLBACK"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
