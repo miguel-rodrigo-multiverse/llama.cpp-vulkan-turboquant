@@ -3,12 +3,17 @@
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
+#include "llama-turboquant-codec.h"
+#include "llama-turboquant-runtime.h"
 #include "llama-context.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -73,6 +78,13 @@ static ggml_tensor * ggml_mul_mat_aux(
     return res;
 }
 
+namespace {
+    enum llama_kv_state_codec : uint32_t {
+        LLAMA_KV_STATE_CODEC_RAW = 0,
+        LLAMA_KV_STATE_CODEC_TURBOQUANT = 1,
+    };
+}
+
 //
 // llama_kv_cache
 //
@@ -81,6 +93,12 @@ llama_kv_cache::llama_kv_cache(
         const llama_model & model,
                 ggml_type   type_k,
                 ggml_type   type_v,
+     llama_kv_cache_codec   codec,
+ llama_turboquant_runtime   turboquant_runtime,
+                 uint32_t   turboquant_group_size,
+                 uint32_t   turboquant_residual_bits,
+                     bool   turboquant_qjl,
+                     bool   turboquant_allow_fallback,
                      bool   v_trans,
                      bool   offload,
                      bool   unified,
@@ -92,6 +110,11 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
     model(model), hparams(model.hparams), v_trans(v_trans),
+    codec(codec), turboquant_runtime(turboquant_runtime),
+    turboquant_group_size(turboquant_group_size),
+    turboquant_residual_bits(turboquant_residual_bits),
+    turboquant_qjl(turboquant_qjl),
+    turboquant_allow_fallback(turboquant_allow_fallback),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
@@ -279,6 +302,42 @@ llama_kv_cache::llama_kv_cache(
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+        if (codec == LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
+            LLAMA_LOG_WARN("%s: TurboQuant codec selected (runtime=%s, group=%u, residual_bits=%u, qjl=%s, fallback=%s) - using baseline KV tensor layout until TurboQuant kernels land\n",
+                    __func__,
+                    llama_turboquant_runtime_name(turboquant_runtime),
+                    turboquant_group_size,
+                    turboquant_residual_bits,
+                    turboquant_qjl ? "true" : "false",
+                    turboquant_allow_fallback ? "true" : "false");
+        }
+    }
+
+    if (codec == LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
+        const llama_turboquant_codec_params tq_params = {
+            /*.group_size    =*/ turboquant_group_size,
+            /*.residual_bits =*/ turboquant_residual_bits,
+            /*.qjl           =*/ turboquant_qjl,
+        };
+
+        turboquant_shadow_layers.resize(layers.size());
+        for (size_t i = 0; i < layers.size(); ++i) {
+            const auto & layer = layers[i];
+            auto & shadow = turboquant_shadow_layers[i];
+
+            shadow.row_size_k = llama_turboquant_row_size(layer.k->ne[0], tq_params);
+            shadow.k_rows.resize(n_stream, std::vector<uint8_t>(get_size() * shadow.row_size_k, 0));
+            shadow.k_dirty.resize(n_stream, std::vector<uint8_t>(get_size(), 0));
+            shadow.k_backend_seeded.resize(n_stream, 0);
+
+            if (layer.v) {
+                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
+                shadow.row_size_v = llama_turboquant_row_size(n_embd_v_gqa, tq_params);
+                shadow.v_rows.resize(n_stream, std::vector<uint8_t>(get_size() * shadow.row_size_v, 0));
+                shadow.v_dirty.resize(n_stream, std::vector<uint8_t>(get_size(), 0));
+                shadow.v_backend_seeded.resize(n_stream, 0);
+            }
+        }
     }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
@@ -300,7 +359,7 @@ llama_kv_cache::llama_kv_cache(
         hparams.n_embd_head_v() % 64 == 0;
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
-    LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
+    LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_v_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
     // pre-compute the haramard matrices and keep them in host memory
     // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
@@ -336,6 +395,22 @@ void llama_kv_cache::clear(bool data) {
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
+        }
+        for (auto & shadow : turboquant_shadow_layers) {
+            for (auto & rows : shadow.k_rows) {
+                std::fill(rows.begin(), rows.end(), 0);
+            }
+            for (auto & rows : shadow.v_rows) {
+                std::fill(rows.begin(), rows.end(), 0);
+            }
+            for (auto & dirty : shadow.k_dirty) {
+                std::fill(dirty.begin(), dirty.end(), 0);
+            }
+            for (auto & dirty : shadow.v_dirty) {
+                std::fill(dirty.begin(), dirty.end(), 0);
+            }
+            std::fill(shadow.k_backend_seeded.begin(), shadow.k_backend_seeded.end(), 0);
+            std::fill(shadow.v_backend_seeded.begin(), shadow.v_backend_seeded.end(), 0);
         }
     }
 }
@@ -1142,7 +1217,53 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+void llama_kv_cache::print_turboquant_stats() const {
+    if (codec != LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
+        return;
+    }
+
+    const bool direct_profile = getenv("LLAMA_TURBOQUANT_PROFILE") != nullptr;
+
+    if (direct_profile) {
+        std::cerr
+                << "llama_turboquant profile:"
+                << " runtime=" << llama_turboquant_runtime_name(turboquant_runtime)
+                << " sync_calls=" << tq_stats.sync_calls
+                << " sync_rows_k=" << tq_stats.sync_rows_k
+                << " sync_rows_v=" << tq_stats.sync_rows_v
+                << " sync_ms=" << tq_stats.sync_ms
+                << " materialize_calls=" << tq_stats.materialize_calls
+                << " materialize_rows_k=" << tq_stats.materialize_rows_k
+                << " materialize_rows_v=" << tq_stats.materialize_rows_v
+                << " materialize_ms=" << tq_stats.materialize_ms
+                << " native_calls=" << tq_stats.native_calls
+                << " staged_calls=" << tq_stats.staged_calls
+                << " cpu_fallback_calls=" << tq_stats.cpu_fallback_calls
+                << std::endl;
+    }
+
+    LLAMA_LOG_INFO(
+            "%s: runtime=%s sync_calls=%" PRIu64 " sync_rows_k=%" PRIu64 " sync_rows_v=%" PRIu64 " sync_ms=%.3f materialize_calls=%" PRIu64 " materialize_rows_k=%" PRIu64 " materialize_rows_v=%" PRIu64 " materialize_ms=%.3f native_calls=%" PRIu64 " staged_calls=%" PRIu64 " cpu_fallback_calls=%" PRIu64 "\n",
+            __func__,
+            llama_turboquant_runtime_name(turboquant_runtime),
+            tq_stats.sync_calls,
+            tq_stats.sync_rows_k,
+            tq_stats.sync_rows_v,
+            tq_stats.sync_ms,
+            tq_stats.materialize_calls,
+            tq_stats.materialize_rows_k,
+            tq_stats.materialize_rows_v,
+            tq_stats.materialize_ms,
+            tq_stats.native_calls,
+            tq_stats.staged_calls,
+            tq_stats.cpu_fallback_calls);
+}
+
+bool llama_kv_cache::uses_turboquant_live_path() const {
+    return codec == LLAMA_KV_CACHE_CODEC_TURBOQUANT && !turboquant_allow_fallback;
+}
+
+ggml_tensor * llama_kv_cache::get_k_raw(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
@@ -1162,7 +1283,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_v_raw(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -1194,7 +1315,35 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    if (codec == LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
+        if (!sync_turboquant_shadow_backend(sinfo, n_kv, /*do_k=*/true, /*do_v=*/false)) {
+            if (!warned_turboquant_live_fallback) {
+                LLAMA_LOG_WARN("%s: TurboQuant live attention currently uses host-side reference materialization from the compressed shadow\n", __func__);
+                warned_turboquant_live_fallback = true;
+            }
+            materialize_turboquant_shadow(sinfo, n_kv, /*do_k=*/true, /*do_v=*/false);
+        }
+    }
+
+    return get_k_raw(ctx, il, n_kv, sinfo);
+}
+
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    if (codec == LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
+        if (!sync_turboquant_shadow_backend(sinfo, n_kv, /*do_k=*/false, /*do_v=*/true)) {
+            if (!warned_turboquant_live_fallback) {
+                LLAMA_LOG_WARN("%s: TurboQuant live attention currently uses host-side reference materialization from the compressed shadow\n", __func__);
+                warned_turboquant_live_fallback = true;
+            }
+            materialize_turboquant_shadow(sinfo, n_kv, /*do_k=*/false, /*do_v=*/true);
+        }
+    }
+
+    return get_v_raw(ctx, il, n_kv, sinfo);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k_raw(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
@@ -1229,7 +1378,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 
-ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::cpy_v_raw(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
@@ -1283,6 +1432,294 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     v_cur = ggml_reshape_2d(ctx, v_cur, 1, ggml_nelements(v_cur));
 
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+    if (codec == LLAMA_KV_CACHE_CODEC_TURBOQUANT && !warned_turboquant_live_fallback) {
+        LLAMA_LOG_WARN("%s: TurboQuant live write path currently stores baseline KV tensors and refreshes the compressed shadow post-compute\n", __func__);
+        warned_turboquant_live_fallback = true;
+    }
+
+    return cpy_k_raw(ctx, k_cur, k_idxs, il, sinfo);
+}
+
+ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
+    if (codec == LLAMA_KV_CACHE_CODEC_TURBOQUANT && !warned_turboquant_live_fallback) {
+        LLAMA_LOG_WARN("%s: TurboQuant live write path currently stores baseline KV tensors and refreshes the compressed shadow post-compute\n", __func__);
+        warned_turboquant_live_fallback = true;
+    }
+
+    return cpy_v_raw(ctx, v_cur, v_idxs, il, sinfo);
+}
+
+void llama_kv_cache::sync_turboquant_shadow(const slot_info & sinfo) const {
+    if (codec != LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
+        return;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t rows_k = 0;
+    uint64_t rows_v = 0;
+
+    const llama_turboquant_codec_params tq_params = {
+        /*.group_size    =*/ turboquant_group_size,
+        /*.residual_bits =*/ turboquant_residual_bits,
+        /*.qjl           =*/ turboquant_qjl,
+    };
+
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        const auto & layer = layers[ikv];
+        auto & shadow = turboquant_shadow_layers[ikv];
+
+        std::vector<uint8_t> row_k(ggml_row_size(layer.k->type, layer.k->ne[0]));
+        std::vector<uint8_t> row_v(layer.v ? ggml_row_size(layer.v->type, hparams.n_embd_v_gqa(layer.il)) : 0);
+        std::vector<uint8_t> packed;
+
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const uint32_t strm = sinfo.strm[s];
+            auto * k = layer.k_stream[strm];
+
+            for (uint32_t i = 0; i < sinfo.idxs[s].size(); ++i) {
+                const uint32_t idx = sinfo.idxs[s][i];
+                ggml_backend_tensor_get(k, row_k.data(), idx * row_k.size(), row_k.size());
+                llama_turboquant_pack_row(row_k.data(), k->type, layer.k->ne[0], tq_params, packed);
+                std::memcpy(shadow.k_rows[strm].data() + idx * shadow.row_size_k, packed.data(), packed.size());
+                shadow.k_dirty[strm][idx] = 1;
+                ++rows_k;
+
+                if (!layer.v) {
+                    continue;
+                }
+
+                auto * v = layer.v_stream[strm];
+                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
+
+                if (!v_trans) {
+                    ggml_backend_tensor_get(v, row_v.data(), idx * row_v.size(), row_v.size());
+                } else {
+                    const size_t v_size_el = ggml_type_size(v->type);
+                    for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                        const size_t src_offset = (idx + j * get_size()) * v_size_el;
+                        ggml_backend_tensor_get(v, row_v.data() + j * v_size_el, src_offset, v_size_el);
+                    }
+                }
+
+                llama_turboquant_pack_row(row_v.data(), v->type, n_embd_v_gqa, tq_params, packed);
+                std::memcpy(shadow.v_rows[strm].data() + idx * shadow.row_size_v, packed.data(), packed.size());
+                shadow.v_dirty[strm][idx] = 1;
+                ++rows_v;
+            }
+        }
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    tq_stats.sync_calls += 1;
+    tq_stats.sync_rows_k += rows_k;
+    tq_stats.sync_rows_v += rows_v;
+    tq_stats.sync_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+void llama_kv_cache::materialize_turboquant_shadow(const slot_info & sinfo, uint32_t n_kv, bool do_k, bool do_v) const {
+    if (codec != LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
+        return;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t rows_k = 0;
+    uint64_t rows_v = 0;
+
+    const llama_turboquant_codec_params tq_params = {
+        /*.group_size    =*/ turboquant_group_size,
+        /*.residual_bits =*/ turboquant_residual_bits,
+        /*.qjl           =*/ turboquant_qjl,
+    };
+
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        const auto & layer = layers[ikv];
+        auto & shadow = turboquant_shadow_layers[ikv];
+
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const uint32_t strm = sinfo.strm[s];
+
+            if (do_k) {
+                auto * k = layer.k_stream[strm];
+                llama_turboquant_runtime_request request = {
+                    /*.runtime      =*/ turboquant_runtime,
+                    /*.codec_params =*/ tq_params,
+                    /*.buffer       =*/ {
+                        /*.tensor      =*/ k,
+                        /*.type        =*/ k->type,
+                        /*.n_row_el    =*/ (uint32_t) layer.k->ne[0],
+                        /*.kv_size     =*/ get_size(),
+                        /*.transposed  =*/ false,
+                    },
+                    /*.rows         =*/ {},
+                };
+                request.rows.reserve(n_kv);
+                for (uint32_t i = 0; i < n_kv; ++i) {
+                    if (!shadow.k_dirty[strm][i]) {
+                        continue;
+                    }
+                    request.rows.push_back({
+                        /*.packed      =*/ shadow.k_rows[strm].data() + i * shadow.row_size_k,
+                        /*.packed_size =*/ shadow.row_size_k,
+                        /*.row_index   =*/ i,
+                    });
+                }
+
+                if (!request.rows.empty()) {
+                    rows_k += request.rows.size();
+                    std::string reason;
+                    if (!llama_turboquant_runtime_materialize(request, reason)) {
+                        LLAMA_LOG_WARN("%s: TurboQuant K runtime fallback: %s\n", __func__, reason.c_str());
+                        llama_turboquant_runtime_request cpu_request = request;
+                        cpu_request.runtime = LLAMA_TURBOQUANT_RUNTIME_AUTO;
+                        tq_stats.cpu_fallback_calls += 1;
+                        GGML_ASSERT(llama_turboquant_runtime_materialize(cpu_request, reason));
+                    } else {
+                        if (reason.find("using staged upload fallback") != std::string::npos) {
+                            tq_stats.staged_calls += 1;
+                        } else {
+                            tq_stats.native_calls += 1;
+                        }
+                    }
+                    for (const auto & row : request.rows) {
+                        shadow.k_dirty[strm][row.row_index] = 0;
+                    }
+                }
+            }
+
+            if (do_v && layer.v) {
+                auto * v = layer.v_stream[strm];
+                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
+                llama_turboquant_runtime_request request = {
+                    /*.runtime      =*/ turboquant_runtime,
+                    /*.codec_params =*/ tq_params,
+                    /*.buffer       =*/ {
+                        /*.tensor      =*/ v,
+                        /*.type        =*/ v->type,
+                        /*.n_row_el    =*/ n_embd_v_gqa,
+                        /*.kv_size     =*/ get_size(),
+                        /*.transposed  =*/ v_trans,
+                    },
+                    /*.rows         =*/ {},
+                };
+                request.rows.reserve(n_kv);
+                for (uint32_t i = 0; i < n_kv; ++i) {
+                    if (!shadow.v_dirty[strm][i]) {
+                        continue;
+                    }
+                    request.rows.push_back({
+                        /*.packed      =*/ shadow.v_rows[strm].data() + i * shadow.row_size_v,
+                        /*.packed_size =*/ shadow.row_size_v,
+                        /*.row_index   =*/ i,
+                    });
+                }
+
+                if (!request.rows.empty()) {
+                    rows_v += request.rows.size();
+                    std::string reason;
+                    if (!llama_turboquant_runtime_materialize(request, reason)) {
+                        LLAMA_LOG_WARN("%s: TurboQuant V runtime fallback: %s\n", __func__, reason.c_str());
+                        llama_turboquant_runtime_request cpu_request = request;
+                        cpu_request.runtime = LLAMA_TURBOQUANT_RUNTIME_AUTO;
+                        tq_stats.cpu_fallback_calls += 1;
+                        GGML_ASSERT(llama_turboquant_runtime_materialize(cpu_request, reason));
+                    } else {
+                        if (reason.find("using staged upload fallback") != std::string::npos) {
+                            tq_stats.staged_calls += 1;
+                        } else {
+                            tq_stats.native_calls += 1;
+                        }
+                    }
+                    for (const auto & row : request.rows) {
+                        shadow.v_dirty[strm][row.row_index] = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    tq_stats.materialize_calls += 1;
+    tq_stats.materialize_rows_k += rows_k;
+    tq_stats.materialize_rows_v += rows_v;
+    tq_stats.materialize_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+bool llama_kv_cache::sync_turboquant_shadow_backend(const slot_info & sinfo, uint32_t n_kv, bool do_k, bool do_v) const {
+    if (codec != LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
+        return false;
+    }
+
+    const llama_turboquant_codec_params tq_params = {
+        /*.group_size    =*/ turboquant_group_size,
+        /*.residual_bits =*/ turboquant_residual_bits,
+        /*.qjl           =*/ turboquant_qjl,
+    };
+    bool any_attempted = false;
+    bool all_synced = true;
+
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        const auto & layer = layers[ikv];
+        auto & shadow = turboquant_shadow_layers[ikv];
+
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const uint32_t strm = sinfo.strm[s];
+
+            auto sync_one = [&](ggml_tensor * tensor, uint32_t n_row_el, bool transposed, std::vector<uint8_t> & dirty, std::vector<uint8_t> & rows, std::vector<uint8_t> & seeded, size_t row_size) {
+                llama_turboquant_runtime_request request = {
+                    /*.runtime      =*/ turboquant_runtime,
+                    /*.codec_params =*/ tq_params,
+                    /*.buffer       =*/ {
+                        /*.tensor      =*/ tensor,
+                        /*.type        =*/ tensor->type,
+                        /*.n_row_el    =*/ n_row_el,
+                        /*.kv_size     =*/ get_size(),
+                        /*.transposed  =*/ transposed,
+                    },
+                    /*.rows         =*/ {},
+                };
+
+                request.rows.reserve(n_kv);
+                for (uint32_t i = 0; i < n_kv; ++i) {
+                    if (!dirty[i] && seeded[strm]) {
+                        continue;
+                    }
+                    request.rows.push_back({
+                        /*.packed      =*/ rows.data() + i * row_size,
+                        /*.packed_size =*/ row_size,
+                        /*.row_index   =*/ i,
+                    });
+                }
+
+                if (request.rows.empty()) {
+                    return;
+                }
+
+                any_attempted = true;
+                std::string reason;
+                if (llama_turboquant_runtime_sync_shadow(request, reason)) {
+                    for (const auto & row : request.rows) {
+                        dirty[row.row_index] = 0;
+                    }
+                    seeded[strm] = 1;
+                } else {
+                    all_synced = false;
+                }
+            };
+
+            if (do_k) {
+                sync_one(layer.k_stream[strm], (uint32_t) layer.k->ne[0], false, shadow.k_dirty[strm], shadow.k_rows[strm], shadow.k_backend_seeded, shadow.row_size_k);
+            }
+
+            if (do_v && layer.v) {
+                sync_one(layer.v_stream[strm], hparams.n_embd_v_gqa(layer.il), v_trans, shadow.v_dirty[strm], shadow.v_rows[strm], shadow.v_backend_seeded, shadow.row_size_v);
+            }
+        }
+    }
+
+    return !any_attempted || all_synced;
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -1972,8 +2409,44 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     const uint32_t v_trans = this->v_trans ? 1 : 0;
     const uint32_t n_layer = layers.size();
 
+    uint32_t cell_count = 0;
+    const llama_turboquant_codec_params tq_params = {
+        /*.group_size    =*/ turboquant_group_size,
+        /*.residual_bits =*/ turboquant_residual_bits,
+        /*.qjl           =*/ turboquant_qjl,
+    };
+
+    for (const auto & range : cr.data) {
+        cell_count += range.second - range.first;
+    }
+
+    bool can_use_turboquant = codec == LLAMA_KV_CACHE_CODEC_TURBOQUANT;
+    if (can_use_turboquant) {
+        for (const auto & layer : layers) {
+            if (!llama_turboquant_codec_supports_type(layer.k->type)) {
+                can_use_turboquant = false;
+                break;
+            }
+            if (layer.v && !llama_turboquant_codec_supports_type(layer.v->type)) {
+                can_use_turboquant = false;
+                break;
+            }
+        }
+    }
+
+    const uint32_t state_codec = can_use_turboquant ? LLAMA_KV_STATE_CODEC_TURBOQUANT : LLAMA_KV_STATE_CODEC_RAW;
+    if (codec == LLAMA_KV_CACHE_CODEC_TURBOQUANT && !can_use_turboquant) {
+        LLAMA_LOG_WARN("%s: TurboQuant state codec requested, but K/V cache types are not all F32/F16/BF16 - writing raw KV state instead\n", __func__);
+    }
+
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
+    io.write(&state_codec, sizeof(state_codec));
+    io.write(&tq_params.group_size, sizeof(tq_params.group_size));
+    io.write(&tq_params.residual_bits, sizeof(tq_params.residual_bits));
+    const uint32_t tq_qjl = tq_params.qjl ? 1 : 0;
+    io.write(&tq_qjl, sizeof(tq_qjl));
+
 
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
@@ -1992,11 +2465,24 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
         io.write(&k_size_row, sizeof(k_size_row));
 
-        // Read each range of cells of k_size length and write out
-        for (const auto & range : cr.data) {
-            const size_t range_size = range.second - range.first;
-            const size_t buf_size = range_size * k_size_row;
-            io.write_tensor(k, range.first * k_size_row, buf_size);
+        if (state_codec == LLAMA_KV_STATE_CODEC_RAW) {
+            // Read each range of cells of k_size length and write out
+            for (const auto & range : cr.data) {
+                const size_t range_size = range.second - range.first;
+                const size_t buf_size = range_size * k_size_row;
+                io.write_tensor(k, range.first * k_size_row, buf_size);
+            }
+        } else {
+            std::vector<uint8_t> row_data(k_size_row);
+            std::vector<uint8_t> packed_row;
+
+            for (const auto & range : cr.data) {
+                for (uint32_t i = range.first; i < range.second; ++i) {
+                    ggml_backend_tensor_get(k, row_data.data(), i * k_size_row, k_size_row);
+                    llama_turboquant_pack_row(row_data.data(), k->type, n_embd_k_gqa, tq_params, packed_row);
+                    io.write(packed_row.data(), packed_row.size());
+                }
+            }
         }
     }
 
@@ -2019,11 +2505,24 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             const uint64_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
             io.write(&v_size_row, sizeof(v_size_row));
 
-            // Read each range of cells of v_size length and write out
-            for (const auto & range : cr.data) {
-                const size_t range_size = range.second - range.first;
-                const size_t buf_size = range_size * v_size_row;
-                io.write_tensor(v, range.first * v_size_row, buf_size);
+            if (state_codec == LLAMA_KV_STATE_CODEC_RAW) {
+                // Read each range of cells of v_size length and write out
+                for (const auto & range : cr.data) {
+                    const size_t range_size = range.second - range.first;
+                    const size_t buf_size = range_size * v_size_row;
+                    io.write_tensor(v, range.first * v_size_row, buf_size);
+                }
+            } else {
+                std::vector<uint8_t> row_data(v_size_row);
+                std::vector<uint8_t> packed_row;
+
+                for (const auto & range : cr.data) {
+                    for (uint32_t i = range.first; i < range.second; ++i) {
+                        ggml_backend_tensor_get(v, row_data.data(), i * v_size_row, v_size_row);
+                        llama_turboquant_pack_row(row_data.data(), v->type, n_embd_v_gqa, tq_params, packed_row);
+                        io.write(packed_row.data(), packed_row.size());
+                    }
+                }
             }
         }
     } else {
@@ -2053,12 +2552,28 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
             // For each row, we get the element values of each cell
             for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                // Read each range of cells of v_size_el length and write out
-                for (const auto & range : cr.data) {
-                    const size_t range_size = range.second - range.first;
-                    const size_t src_offset = (range.first + j * kv_size) * v_size_el;
-                    const size_t buf_size = range_size * v_size_el;
-                    io.write_tensor(v, src_offset, buf_size);
+                if (state_codec == LLAMA_KV_STATE_CODEC_RAW) {
+                    // Read each range of cells of v_size_el length and write out
+                    for (const auto & range : cr.data) {
+                        const size_t range_size = range.second - range.first;
+                        const size_t src_offset = (range.first + j * kv_size) * v_size_el;
+                        const size_t buf_size = range_size * v_size_el;
+                        io.write_tensor(v, src_offset, buf_size);
+                    }
+                } else {
+                    std::vector<uint8_t> row_data(cell_count * v_size_el);
+                    std::vector<uint8_t> packed_row;
+                    size_t row_offset = 0;
+
+                    for (const auto & range : cr.data) {
+                        const size_t range_size = range.second - range.first;
+                        const size_t src_offset = (range.first + j * kv_size) * v_size_el;
+                        ggml_backend_tensor_get(v, row_data.data() + row_offset, src_offset, range_size * v_size_el);
+                        row_offset += range_size * v_size_el;
+                    }
+
+                    llama_turboquant_pack_row(row_data.data(), v->type, cell_count, tq_params, packed_row);
+                    io.write(packed_row.data(), packed_row.size());
                 }
             }
         }
@@ -2189,9 +2704,17 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
     uint32_t v_trans;
     uint32_t n_layer;
+    uint32_t state_codec;
+    llama_turboquant_codec_params tq_params;
+    uint32_t tq_qjl;
 
     io.read(&v_trans, sizeof(v_trans));
     io.read(&n_layer, sizeof(n_layer));
+    io.read(&state_codec, sizeof(state_codec));
+    io.read(&tq_params.group_size, sizeof(tq_params.group_size));
+    io.read(&tq_params.residual_bits, sizeof(tq_params.residual_bits));
+    io.read(&tq_qjl, sizeof(tq_qjl));
+    tq_params.qjl = tq_qjl != 0;
 
     if (n_layer != layers.size()) {
         LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) layers.size());
@@ -2205,6 +2728,11 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
     if (this->v_trans != (bool) v_trans) {
         LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
+        return false;
+    }
+
+    if (state_codec != LLAMA_KV_STATE_CODEC_RAW && state_codec != LLAMA_KV_STATE_CODEC_TURBOQUANT) {
+        LLAMA_LOG_ERROR("%s: unsupported KV state codec (%u)\n", __func__, state_codec);
         return false;
     }
 
@@ -2234,16 +2762,35 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        if (cell_count) {
+        if (cell_count && state_codec == LLAMA_KV_STATE_CODEC_RAW) {
             if (sinfo.is_contiguous()) {
                 // Fast path: contiguous cells, single memcpy
-                io.read_tensor(k, sinfo.head() * k_size_row, cell_count * k_size_row);
+                io.read_tensor(k, sinfo.head() * k_size_row, cell_count * k_size_row); // TODO(miguel): make sure we don't need ggml_backend_tensor_set instead since we are writing directly to the tensor buffer
             } else {
                 // Slow path: scatter to non-contiguous positions
                 for (uint32_t i = 0; i < cell_count; ++i) {
                     const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
-                    io.read_tensor(k, dst_offset, k_size_row);
+                    io.read_tensor(k, dst_offset, k_size_row); // TODO(miguel): make sure we don't need ggml_backend_tensor_set instead since we are writing directly to the tensor buffer
                 }
+            }
+        } else if (cell_count) {
+            if (!llama_turboquant_codec_supports_type(k->type)) {
+                LLAMA_LOG_ERROR("%s: TurboQuant state codec does not support key type %s (layer %d)\n", __func__, ggml_type_name(k->type), il);
+                return false;
+            }
+
+            const size_t packed_row_size = llama_turboquant_row_size(n_embd_k_gqa, tq_params);
+            std::vector<uint8_t> row_data(k_size_row);
+
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                llama_turboquant_unpack_row(
+                        static_cast<const uint8_t *>(io.read(packed_row_size)),
+                        k->type,
+                        n_embd_k_gqa,
+                        tq_params,
+                        row_data.data());
+                const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
+                ggml_backend_tensor_set(k, row_data.data(), dst_offset, k_size_row); // TODO(miguel): if not, we can change this to io.read_tensor
             }
         }
     }
@@ -2277,7 +2824,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            if (cell_count) {
+            if (cell_count && state_codec == LLAMA_KV_STATE_CODEC_RAW) {
                 if (sinfo.is_contiguous()) {
                     // Fast path: contiguous cells, single memcpy
                     io.read_tensor(v, sinfo.head() * v_size_row, cell_count * v_size_row);
@@ -2287,6 +2834,25 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                         const size_t dst_offset = sinfo.idxs[0][i] * v_size_row;
                         io.read_tensor(v, dst_offset, v_size_row);
                     }
+                }
+            } else if (cell_count) {
+                if (!llama_turboquant_codec_supports_type(v->type)) {
+                    LLAMA_LOG_ERROR("%s: TurboQuant state codec does not support value type %s (layer %d)\n", __func__, ggml_type_name(v->type), il);
+                    return false;
+                }
+
+                const size_t packed_row_size = llama_turboquant_row_size(n_embd_v_gqa, tq_params);
+                std::vector<uint8_t> row_data(v_size_row);
+
+                for (uint32_t i = 0; i < cell_count; ++i) {
+                    llama_turboquant_unpack_row(
+                            static_cast<const uint8_t *>(io.read(packed_row_size)),
+                            v->type,
+                            n_embd_v_gqa,
+                            tq_params,
+                            row_data.data());
+                    const size_t dst_offset = sinfo.idxs[0][i] * v_size_row;
+                    ggml_backend_tensor_set(v, row_data.data(), dst_offset, v_size_row);
                 }
             }
         }
@@ -2328,7 +2894,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            if (cell_count) {
+            if (cell_count && state_codec == LLAMA_KV_STATE_CODEC_RAW) {
                 if (sinfo.is_contiguous()) {
                     // Fast path: contiguous cells
                     const uint32_t h = sinfo.head();
@@ -2342,6 +2908,32 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                         for (uint32_t i = 0; i < cell_count; ++i) {
                             const size_t dst_offset = (sinfo.idxs[0][i] + j * cells.size()) * v_size_el;
                             io.read_tensor(v, dst_offset, v_size_el);
+                        }
+                    }
+                }
+            } else if (cell_count) {
+                if (!llama_turboquant_codec_supports_type(v->type)) {
+                    LLAMA_LOG_ERROR("%s: TurboQuant state codec does not support value type %s (layer %d)\n", __func__, ggml_type_name(v->type), il);
+                    return false;
+                }
+
+                const size_t packed_row_size = llama_turboquant_row_size(cell_count, tq_params);
+                for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                    std::vector<uint8_t> row_data(cell_count * v_size_el);
+                    llama_turboquant_unpack_row(
+                            static_cast<const uint8_t *>(io.read(packed_row_size)),
+                            v->type,
+                            cell_count,
+                            tq_params,
+                            row_data.data());
+
+                    if (sinfo.is_contiguous()) {
+                        const size_t dst_offset = (sinfo.head() + j * cells.size()) * v_size_el;
+                        ggml_backend_tensor_set(v, row_data.data(), dst_offset, row_data.size());
+                    } else {
+                        for (uint32_t i = 0; i < cell_count; ++i) {
+                            const size_t dst_offset = (sinfo.idxs[0][i] + j * cells.size()) * v_size_el;
+                            ggml_backend_tensor_set(v, row_data.data() + i * v_size_el, dst_offset, v_size_el);
                         }
                     }
                 }
@@ -2499,4 +3091,13 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+void llama_kv_cache_context::post_compute(llama_context * lctx) {
+    if (ubatches.empty()) {
+        return;
+    }
+
+    lctx->synchronize();
+    kv->sync_turboquant_shadow(sinfos[i_cur]);
 }

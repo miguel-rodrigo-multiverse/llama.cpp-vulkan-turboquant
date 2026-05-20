@@ -15,6 +15,12 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
                 ggml_type   type_k,
                 ggml_type   type_v,
+     llama_kv_cache_codec   codec,
+ llama_turboquant_runtime   turboquant_runtime,
+                 uint32_t   turboquant_group_size,
+                 uint32_t   turboquant_residual_bits,
+                     bool   turboquant_qjl,
+                     bool   turboquant_allow_fallback,
                      bool   v_trans,
                      bool   offload,
                      bool   swa_full,
@@ -61,6 +67,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     kv_base = std::make_unique<llama_kv_cache>(
             model, type_k, type_v,
+            codec, turboquant_runtime, turboquant_group_size, turboquant_residual_bits, turboquant_qjl, turboquant_allow_fallback,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, filter_base, reuse);
 
@@ -68,6 +75,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     kv_swa = std::make_unique<llama_kv_cache>(
             model, type_k, type_v,
+            codec, turboquant_runtime, turboquant_group_size, turboquant_residual_bits, turboquant_qjl, turboquant_allow_fallback,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, filter_swa, reuse);
 }

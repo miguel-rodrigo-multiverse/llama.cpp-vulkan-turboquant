@@ -19,6 +19,7 @@ struct llama_context;
 
 class llama_kv_cache : public llama_memory_i {
 public:
+    friend class llama_kv_cache_context;
     struct stream_copy_info {
         bool empty() const {
             assert(ssrc.size() == sdst.size());
@@ -97,6 +98,12 @@ public:
             const llama_model & model,
                     ggml_type   type_k,
                     ggml_type   type_v,
+         llama_kv_cache_codec   codec,
+     llama_turboquant_runtime   turboquant_runtime,
+                     uint32_t   turboquant_group_size,
+                     uint32_t   turboquant_residual_bits,
+                         bool   turboquant_qjl,
+                         bool   turboquant_allow_fallback,
                          bool   v_trans,
                          bool   offload,
                          bool   unified,
@@ -154,6 +161,7 @@ public:
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+    void print_turboquant_stats() const;
 
     //
     // graph_build API
@@ -224,7 +232,24 @@ private:
         std::vector<ggml_tensor *> v_stream;
     };
 
+    struct turboquant_shadow_layer {
+        size_t row_size_k = 0;
+        size_t row_size_v = 0;
+        std::vector<std::vector<uint8_t>> k_rows;
+        std::vector<std::vector<uint8_t>> v_rows;
+        std::vector<std::vector<uint8_t>> k_dirty;
+        std::vector<std::vector<uint8_t>> v_dirty;
+        std::vector<uint8_t> k_backend_seeded;
+        std::vector<uint8_t> v_backend_seeded;
+    };
+
     bool v_trans = true;  // the value tensor is transposed
+    const llama_kv_cache_codec codec = LLAMA_KV_CACHE_CODEC_NONE;
+    const llama_turboquant_runtime turboquant_runtime = LLAMA_TURBOQUANT_RUNTIME_AUTO;
+    const uint32_t turboquant_group_size = 64;
+    const uint32_t turboquant_residual_bits = 1;
+    const bool turboquant_qjl = true;
+    const bool turboquant_allow_fallback = true;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -269,14 +294,45 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+    mutable std::vector<turboquant_shadow_layer> turboquant_shadow_layers;
+
+    struct turboquant_stats {
+        uint64_t sync_calls = 0;
+        uint64_t sync_rows_k = 0;
+        uint64_t sync_rows_v = 0;
+        uint64_t materialize_calls = 0;
+        uint64_t materialize_rows_k = 0;
+        uint64_t materialize_rows_v = 0;
+        uint64_t native_calls = 0;
+        uint64_t staged_calls = 0;
+        uint64_t cpu_fallback_calls = 0;
+        double sync_ms = 0.0;
+        double materialize_ms = 0.0;
+    };
+
+    mutable turboquant_stats tq_stats;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    mutable bool warned_turboquant_live_fallback = false;
 
     size_t total_size() const;
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    bool uses_turboquant_live_path() const;
+
+    ggml_tensor * get_k_raw(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_v_raw(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    ggml_tensor * cpy_k_raw(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_v_raw(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+
+    void sync_turboquant_shadow(const slot_info & sinfo) const;
+    bool sync_turboquant_shadow_backend(const slot_info & sinfo, uint32_t n_kv, bool do_k, bool do_v) const;
+    void materialize_turboquant_shadow(const slot_info & sinfo, uint32_t n_kv, bool do_k, bool do_v) const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
@@ -343,6 +399,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    void post_compute(llama_context * lctx) override;
 
     //
     // llama_kv_cache_context specific API

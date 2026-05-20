@@ -23,6 +23,12 @@ public:
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
+     llama_kv_cache_codec   codec,
+ llama_turboquant_runtime   turboquant_runtime,
+                 uint32_t   turboquant_group_size,
+                 uint32_t   turboquant_residual_bits,
+                     bool   turboquant_qjl,
+                     bool   turboquant_allow_fallback,
                      bool   v_trans,
                      bool   swa_full,
                  uint32_t   kv_size,

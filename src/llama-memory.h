@@ -17,6 +17,12 @@ struct llama_memory_params {
     // kv cache
     ggml_type type_k;
     ggml_type type_v;
+    llama_kv_cache_codec kv_cache_codec;
+    llama_turboquant_runtime turboquant_runtime;
+    uint32_t turboquant_group_size;
+    uint32_t turboquant_residual_bits;
+    bool turboquant_qjl;
+    bool turboquant_allow_fallback;
 
     // use full-size SWA cache
     bool swa_full;
@@ -59,6 +65,11 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // optional hook after the graph for the current ubatch completed successfully
+    virtual void post_compute(llama_context * lctx) {
+        GGML_UNUSED(lctx);
+    }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
