@@ -202,6 +202,7 @@ add_library(ggml-base
             ggml-backend.cpp
             ggml-backend-meta.cpp
             ggml-opt.cpp
+            ggml-turboquant-codec.cpp
             ggml-threading.cpp
             ggml-threading.h
             ggml-quants.c
