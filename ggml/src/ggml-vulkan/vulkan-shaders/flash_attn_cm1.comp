@@ -27,10 +27,18 @@ const uint32_t cols_per_thread = Bc / cols_per_iter;
 
 layout (binding = 0) readonly buffer Q {float data_q[];};
 layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
+#ifdef TURBOQUANT_K
+layout (binding = 1) readonly buffer K_TQ {uint data_k_tq[];};
+#else
 layout (binding = 1) readonly buffer K {float16_t data_k[];};
 layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
+#endif
+#ifdef TURBOQUANT_V
+layout (binding = 2) readonly buffer V_TQ {uint data_v_tq[];};
+#else
 layout (binding = 2) readonly buffer V {float16_t data_v[];};
 layout (binding = 2) readonly buffer VV4 {f16vec4 data_vv4[];};
+#endif
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
 
 shared float tmpsh[row_split];
@@ -55,6 +63,148 @@ const uint32_t osh_stride = row_split * MatBr / 4;
 shared f16vec4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
+
+#ifdef TURBOQUANT_K
+uint tq_read_byte(uint byte_offset) {
+    const uint word = data_k_tq[byte_offset >> 2];
+    const uint shift = (byte_offset & 3u) << 3u;
+    return (word >> shift) & 0xffu;
+}
+
+uint tq_read_u16(uint byte_offset) {
+    return tq_read_byte(byte_offset) | (tq_read_byte(byte_offset + 1u) << 8u);
+}
+
+uint tq_read_bits(uint bit_offset, uint n_bits) {
+    uint value = 0u;
+    for (uint b = 0u; b < n_bits; ++b) {
+        const uint bit = bit_offset + b;
+        const uint byte_offset = bit >> 3u;
+        const uint shift = bit & 7u;
+        value |= ((tq_read_byte(byte_offset) >> shift) & 1u) << b;
+    }
+    return value;
+}
+
+float tq_read_f16(uint byte_offset) {
+    return unpackHalf2x16(tq_read_u16(byte_offset)).x;
+}
+
+float tq_load_k_elem(uint row_index, uint el) {
+    const uint group_size = max(p.nb12, 1u);
+    const uint residual_bits = p.nb13 & 0xffu;
+    const bool qjl = ((p.nb13 >> 8u) & 0x1u) != 0u;
+    const uint group_index = el / group_size;
+    const uint group_start = group_index * group_size;
+    const uint group_el = min(group_size, HSK - group_start);
+    const uint local_index = el - group_start;
+
+    const uint full_sign_bytes = (group_size + 7u) >> 3u;
+    const uint full_residual_bytes = (group_size * residual_bits + 7u) >> 3u;
+    const uint full_group_bytes = 2u + full_sign_bytes + ((qjl && residual_bits > 0u) ? (2u + full_residual_bytes) : 0u);
+
+    const uint sign_bytes = (group_el + 7u) >> 3u;
+    const uint row_base = row_index * p.nb11 + group_index * full_group_bytes;
+    const uint sign_base = row_base + 2u;
+
+    const float primary_scale = tq_read_f16(row_base);
+    const bool positive = tq_read_bits(sign_base * 8u + local_index, 1u) != 0u;
+    float value = positive ? primary_scale : -primary_scale;
+
+    if (qjl && residual_bits > 0u) {
+        const uint residual_scale_base = sign_base + sign_bytes;
+        const uint residual_data_base = residual_scale_base + 2u;
+        const uint levels = 1u << residual_bits;
+        const uint q = tq_read_bits(residual_data_base * 8u + local_index * residual_bits, residual_bits);
+        const float residual_scale = tq_read_f16(residual_scale_base);
+        const float deq = levels <= 1u ? 0.0f : (-1.0f + 2.0f * float(q) / float(levels - 1u));
+        value += residual_scale * deq;
+    }
+
+    return value;
+}
+
+f16vec4 tq_load_k4(uint row_index, uint d4) {
+    const uint el = d4 * 4u;
+    return f16vec4(
+        tq_load_k_elem(row_index, el + 0u),
+        tq_load_k_elem(row_index, el + 1u),
+        tq_load_k_elem(row_index, el + 2u),
+        tq_load_k_elem(row_index, el + 3u)
+    );
+}
+#endif
+
+#ifdef TURBOQUANT_V
+uint tq_v_read_byte(uint byte_offset) {
+    const uint word = data_v_tq[byte_offset >> 2];
+    const uint shift = (byte_offset & 3u) << 3u;
+    return (word >> shift) & 0xffu;
+}
+
+uint tq_v_read_u16(uint byte_offset) {
+    return tq_v_read_byte(byte_offset) | (tq_v_read_byte(byte_offset + 1u) << 8u);
+}
+
+uint tq_v_read_bits(uint bit_offset, uint n_bits) {
+    uint value = 0u;
+    for (uint b = 0u; b < n_bits; ++b) {
+        const uint bit = bit_offset + b;
+        const uint byte_offset = bit >> 3u;
+        const uint shift = bit & 7u;
+        value |= ((tq_v_read_byte(byte_offset) >> shift) & 1u) << b;
+    }
+    return value;
+}
+
+float tq_v_read_f16(uint byte_offset) {
+    return unpackHalf2x16(tq_v_read_u16(byte_offset)).x;
+}
+
+float tq_load_v_elem(uint row_index, uint el) {
+    const uint group_size = max(p.nb22, 1u);
+    const uint residual_bits = p.nb23 & 0xffu;
+    const bool qjl = ((p.nb23 >> 8u) & 0x1u) != 0u;
+    const uint group_index = el / group_size;
+    const uint group_start = group_index * group_size;
+    const uint group_el = min(group_size, HSV - group_start);
+    const uint local_index = el - group_start;
+
+    const uint full_sign_bytes = (group_size + 7u) >> 3u;
+    const uint full_residual_bytes = (group_size * residual_bits + 7u) >> 3u;
+    const uint full_group_bytes = 2u + full_sign_bytes + ((qjl && residual_bits > 0u) ? (2u + full_residual_bytes) : 0u);
+
+    const uint sign_bytes = (group_el + 7u) >> 3u;
+    const uint row_base = row_index * p.nb21 + group_index * full_group_bytes;
+    const uint sign_base = row_base + 2u;
+
+    const float primary_scale = tq_v_read_f16(row_base);
+    const bool positive = tq_v_read_bits(sign_base * 8u + local_index, 1u) != 0u;
+    float value = positive ? primary_scale : -primary_scale;
+
+    if (qjl && residual_bits > 0u) {
+        const uint residual_scale_base = sign_base + sign_bytes;
+        const uint residual_data_base = residual_scale_base + 2u;
+        const uint levels = 1u << residual_bits;
+        const uint q = tq_v_read_bits(residual_data_base * 8u + local_index * residual_bits, residual_bits);
+        const float residual_scale = tq_v_read_f16(residual_scale_base);
+        const float deq = levels <= 1u ? 0.0f : (-1.0f + 2.0f * float(q) / float(levels - 1u));
+        value += residual_scale * deq;
+    }
+
+    return value;
+}
+
+f16vec4 tq_load_v4(uint row_index, uint d4) {
+    const uint el = d4 * 4u;
+    return f16vec4(
+        tq_load_v_elem(row_index, el + 0u),
+        tq_load_v_elem(row_index, el + 1u),
+        tq_load_v_elem(row_index, el + 2u),
+        tq_load_v_elem(row_index, el + 3u)
+    );
+}
+#endif
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
@@ -129,8 +279,17 @@ void main() {
     uint32_t mo_offset = mo_stride * i;
 
     // FaBlockBytesK/V == 2 for f16 (sizeof f16) and == 16 for f32 (vec4) and == ggml block size for quants.
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FaBlockBytesK;
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / FaBlockBytesV;
+#ifdef TURBOQUANT_K
+    uint32_t k_offset = 0;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
+#elif BLOCK_SIZE > 1
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / BLOCK_BYTE_SIZE;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
+#else
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
+#endif
+    
     uint32_t m_offset = gqa_iq1*KV;
     if (p.nem2 != 1 || p.nem3 != 1) {
         m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
@@ -224,14 +383,18 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSK_pad / 4 || c < Bc) {
                     f16vec4 K_Tf = f16vec4(0);
                     if ((!KV_bounds_check || j * Bc + c < KV) && (HSK == HSK_pad || d < HSK / 4)) {
-                        if (USE_DECODE_K) {
-                            uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE_K + 4 * d;
-                            uint ib = coord / BLOCK_SIZE_K;
-                            uint iqs = (coord % BLOCK_SIZE_K);
-                            K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
-                        } else {
-                            K_Tf = f16vec4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
+#ifdef TURBOQUANT_K
+                        if (d < HSK / 4) {
+                            K_Tf = tq_load_k4(j * Bc + c, d);
                         }
+#elif BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE + 4 * d;
+                        uint ib = coord / BLOCK_SIZE;
+                        uint iqs = (coord % BLOCK_SIZE);
+                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+#else
+                        K_Tf = f16vec4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
+#endif
                     }
 
                     kvsh[c * kvsh_stride + d] = K_Tf;
@@ -256,37 +419,49 @@ void main() {
             // For quants we always need to dequant into kvsh; for f16 we can load
             // directly from global memory when alignment / bounds allow it.
             const bool stage_k = USE_DECODE_K || KV_bounds_check || d * 16 + 16 > HSK;
+#if BLOCK_SIZE == 1
             if (stage_k) {
-                barrier();
-                [[unroll]] for (uint32_t idx = 0; idx < Bc * MatBr / 4; idx += gl_WorkGroupSize.x) {
-                    uint32_t col_vec = (idx + tid) % (MatBr / 4);
-                    uint32_t row = (idx + tid) / (MatBr / 4);
-                    if (idx + tid < Bc * MatBr / 4) {
-                        f16vec4 K_Tf = f16vec4(0);
-                        if ((!KV_bounds_check || j * Bc + row < KV) && (HSK == HSK_pad || d * 16 + col_vec * 4 < HSK)) {
-                            if (USE_DECODE_K) {
-                                uint coord = (j * Bc + row) * k_stride * BLOCK_SIZE_K + d * 16 + col_vec * 4;
-                                uint ib = coord / BLOCK_SIZE_K;
-                                uint iqs = (coord % BLOCK_SIZE_K);
-                                K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
-                            } else {
-                                K_Tf = f16vec4(data_kv4[k_offset / 4 + (j * Bc + row) * k_stride / 4 + d * 16 / 4 + col_vec]);
-                            }
-                        }
-
-                        kvsh[row * kvsh_stride + col_vec] = K_Tf;
+#endif
+            barrier();
+            [[unroll]] for (uint32_t idx = 0; idx < Bc * MatBr / 4; idx += gl_WorkGroupSize.x) {
+                uint32_t col_vec = (idx + tid) % (MatBr / 4);
+                uint32_t row = (idx + tid) / (MatBr / 4);
+                if (idx + tid < Bc * MatBr / 4) {
+                    f16vec4 K_Tf = f16vec4(0);
+                    if ((!KV_bounds_check || j * Bc + row < KV) && (HSK == HSK_pad || d * 16 + col_vec * 4 < HSK)) {
+#ifdef TURBOQUANT_K
+                        K_Tf = tq_load_k4(j * Bc + row, d * 16 / 4 + col_vec);
+#elif BLOCK_SIZE > 1
+                        uint coord = (j * Bc + row) * k_stride * BLOCK_SIZE + d * 16 + col_vec * 4;
+                        uint ib = coord / BLOCK_SIZE;
+                        uint iqs = (coord % BLOCK_SIZE);
+                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+#else
+                        K_Tf = f16vec4(data_kv4[k_offset / 4 + (j * Bc + row) * k_stride / 4 + d * 16 / 4 + col_vec]);
+#endif
                     }
-                }
-                barrier();
-            }
 
-            if (stage_k) {
+                    kvsh[row * kvsh_stride + col_vec] = K_Tf;
+                }
+            }
+            barrier();
+#if BLOCK_SIZE == 1
+            }
+#endif
+
+#if BLOCK_SIZE == 1 && !defined(TURBOQUANT_K)
+            if (stage_k)
+#endif
+            {
                 uint coord = (gl_SubgroupID * MatBc) * kvsh_stride;
                 coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
-            } else {
+            }
+#if BLOCK_SIZE == 1 && !defined(TURBOQUANT_K)
+            else {
                 const uint coord = k_offset / 4 + (j * Bc + gl_SubgroupID * MatBc) * k_stride / 4 + d * 16 / 4;
                 coopMatLoad(KMat, data_kv4, coord, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
             }
+#endif
             } else {
                 uint coord = (gl_SubgroupID * MatBc) * kvsh_stride + d * 16 / 4;
                 coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
@@ -387,14 +562,18 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV_pad / 4 || c < Bc) {
                     f16vec4 V_Tf = f16vec4(0);
                     if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
-                        if (USE_DECODE_V) {
-                            uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
-                            uint ib = coord / BLOCK_SIZE_V;
-                            uint iqs = (coord % BLOCK_SIZE_V);
-                            V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-                        } else {
-                            V_Tf = f16vec4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
+#ifdef TURBOQUANT_V
+                        if (d < HSV / 4) {
+                            V_Tf = tq_load_v4(j * Bc + c, d);
                         }
+#elif BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE + 4 * d;
+                        uint ib = coord / BLOCK_SIZE;
+                        uint iqs = (coord % BLOCK_SIZE);
+                        V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+#else
+                        V_Tf = f16vec4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
+#endif
                     }
 
                     kvsh[c * kvsh_stride + d] = V_Tf;
@@ -421,10 +600,12 @@ void main() {
             // staged through a Bc * MatBr size staging buffer.
             // If V is not type f16, then it is always staged for dequantization.
             if (SHMEM_STAGING == 0) {
+#if BLOCK_SIZE == 1
             // For quants we always preload via kvsh. For f16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
             const bool stage_v = USE_DECODE_V || KV_bounds_check;
             if (stage_v) {
+#endif
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
                     const uint row = idx / v_cols;
@@ -438,16 +619,21 @@ void main() {
                     const uint iqs = coord % BLOCK_SIZE_V;
 
                     if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
-                        if (USE_DECODE_V) {
-                            kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-                        } else {
-                            kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
-                        }
+#ifdef TURBOQUANT_V
+                    kvsh[row * vsh_stride + col] = tq_load_v4(v_row, v_col / 4);
+#elif BLOCK_SIZE > 1
+                    kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+#else
+                    kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
+#endif
                     } else {
                         kvsh[row * vsh_stride + col] = f16vec4(0.0f);
                     }
                 }
+
+#if BLOCK_SIZE == 1
             }
+#endif
             }
             barrier();
 
@@ -458,12 +644,15 @@ void main() {
                     coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
 
                     if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check) {
+#if BLOCK_SIZE == 1 && !defined(TURBOQUANT_V)
+                    if (!KV_bounds_check) {
                         // F16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
                         coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
-                    } else {
+                    } else
+#endif
+                    {
                         const uint v_tile_offset = bc_chunk * MatBr * v_cols + gl_SubgroupID * (MatBc / 4);
                         coopMatLoad(QMat, kvsh, v_tile_offset, vsh_stride, gl_CooperativeMatrixLayoutRowMajor);
                     }

@@ -35,10 +35,18 @@ const uint32_t num_subgroups = SubGroupSize == 0 ? 0 : WorkGroupSize / SubGroupS
 
 layout (binding = 0) readonly buffer Q {float data_q[];};
 layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
+#ifdef TURBOQUANT_K
+layout (binding = 1) readonly buffer K_TQ {uint data_k_tq[];};
+#else
 layout (binding = 1) readonly buffer K {float16_t data_k[];};
 layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
+#endif
+#ifdef TURBOQUANT_V
+layout (binding = 2) readonly buffer V_TQ {uint data_v_tq[];};
+#else
 layout (binding = 2) readonly buffer V {float16_t data_v[];};
 layout (binding = 2) readonly buffer VV4 {f16vec4 data_vv4[];};
+#endif
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
 
 // If SubGroupSize is set to 0 then only use shmem reductions
@@ -72,6 +80,148 @@ shared block_a_cache kblocksh[SHMEM_STAGING != 0 ? Bc * qf_stride : 1];
 #endif
 
 shared vec4 occupancy_limiter[LIMIT_OCCUPANCY_SHMEM > 0 ? LIMIT_OCCUPANCY_SHMEM : 1];
+
+#ifdef TURBOQUANT_K
+uint tq_read_byte(uint byte_offset) {
+    const uint word = data_k_tq[byte_offset >> 2];
+    const uint shift = (byte_offset & 3u) << 3u;
+    return (word >> shift) & 0xffu;
+}
+
+uint tq_read_u16(uint byte_offset) {
+    return tq_read_byte(byte_offset) | (tq_read_byte(byte_offset + 1u) << 8u);
+}
+
+uint tq_read_bits(uint bit_offset, uint n_bits) {
+    uint value = 0u;
+    for (uint b = 0u; b < n_bits; ++b) {
+        const uint bit = bit_offset + b;
+        const uint byte_offset = bit >> 3u;
+        const uint shift = bit & 7u;
+        value |= ((tq_read_byte(byte_offset) >> shift) & 1u) << b;
+    }
+    return value;
+}
+
+float tq_read_f16(uint byte_offset) {
+    return unpackHalf2x16(tq_read_u16(byte_offset)).x;
+}
+
+float tq_load_k_elem(uint row_index, uint el) {
+    const uint group_size = max(p.nb12, 1u);
+    const uint residual_bits = p.nb13 & 0xffu;
+    const bool qjl = ((p.nb13 >> 8u) & 0x1u) != 0u;
+    const uint group_index = el / group_size;
+    const uint group_start = group_index * group_size;
+    const uint group_el = min(group_size, HSK - group_start);
+    const uint local_index = el - group_start;
+
+    const uint full_sign_bytes = (group_size + 7u) >> 3u;
+    const uint full_residual_bytes = (group_size * residual_bits + 7u) >> 3u;
+    const uint full_group_bytes = 2u + full_sign_bytes + ((qjl && residual_bits > 0u) ? (2u + full_residual_bytes) : 0u);
+
+    const uint sign_bytes = (group_el + 7u) >> 3u;
+    const uint row_base = row_index * p.nb11 + group_index * full_group_bytes;
+    const uint sign_base = row_base + 2u;
+
+    const float primary_scale = tq_read_f16(row_base);
+    const bool positive = tq_read_bits(sign_base * 8u + local_index, 1u) != 0u;
+    float value = positive ? primary_scale : -primary_scale;
+
+    if (qjl && residual_bits > 0u) {
+        const uint residual_scale_base = sign_base + sign_bytes;
+        const uint residual_data_base = residual_scale_base + 2u;
+        const uint levels = 1u << residual_bits;
+        const uint q = tq_read_bits(residual_data_base * 8u + local_index * residual_bits, residual_bits);
+        const float residual_scale = tq_read_f16(residual_scale_base);
+        const float deq = levels <= 1u ? 0.0f : (-1.0f + 2.0f * float(q) / float(levels - 1u));
+        value += residual_scale * deq;
+    }
+
+    return value;
+}
+
+FLOAT_TYPEV4 tq_load_k4(uint row_index, uint d4) {
+    const uint el = d4 * 4u;
+    return FLOAT_TYPEV4(
+        tq_load_k_elem(row_index, el + 0u),
+        tq_load_k_elem(row_index, el + 1u),
+        tq_load_k_elem(row_index, el + 2u),
+        tq_load_k_elem(row_index, el + 3u)
+    );
+}
+#endif
+
+#ifdef TURBOQUANT_V
+uint tq_v_read_byte(uint byte_offset) {
+    const uint word = data_v_tq[byte_offset >> 2];
+    const uint shift = (byte_offset & 3u) << 3u;
+    return (word >> shift) & 0xffu;
+}
+
+uint tq_v_read_u16(uint byte_offset) {
+    return tq_v_read_byte(byte_offset) | (tq_v_read_byte(byte_offset + 1u) << 8u);
+}
+
+uint tq_v_read_bits(uint bit_offset, uint n_bits) {
+    uint value = 0u;
+    for (uint b = 0u; b < n_bits; ++b) {
+        const uint bit = bit_offset + b;
+        const uint byte_offset = bit >> 3u;
+        const uint shift = bit & 7u;
+        value |= ((tq_v_read_byte(byte_offset) >> shift) & 1u) << b;
+    }
+    return value;
+}
+
+float tq_v_read_f16(uint byte_offset) {
+    return unpackHalf2x16(tq_v_read_u16(byte_offset)).x;
+}
+
+float tq_load_v_elem(uint row_index, uint el) {
+    const uint group_size = max(p.nb22, 1u);
+    const uint residual_bits = p.nb23 & 0xffu;
+    const bool qjl = ((p.nb23 >> 8u) & 0x1u) != 0u;
+    const uint group_index = el / group_size;
+    const uint group_start = group_index * group_size;
+    const uint group_el = min(group_size, HSV - group_start);
+    const uint local_index = el - group_start;
+
+    const uint full_sign_bytes = (group_size + 7u) >> 3u;
+    const uint full_residual_bytes = (group_size * residual_bits + 7u) >> 3u;
+    const uint full_group_bytes = 2u + full_sign_bytes + ((qjl && residual_bits > 0u) ? (2u + full_residual_bytes) : 0u);
+
+    const uint sign_bytes = (group_el + 7u) >> 3u;
+    const uint row_base = row_index * p.nb21 + group_index * full_group_bytes;
+    const uint sign_base = row_base + 2u;
+
+    const float primary_scale = tq_v_read_f16(row_base);
+    const bool positive = tq_v_read_bits(sign_base * 8u + local_index, 1u) != 0u;
+    float value = positive ? primary_scale : -primary_scale;
+
+    if (qjl && residual_bits > 0u) {
+        const uint residual_scale_base = sign_base + sign_bytes;
+        const uint residual_data_base = residual_scale_base + 2u;
+        const uint levels = 1u << residual_bits;
+        const uint q = tq_v_read_bits(residual_data_base * 8u + local_index * residual_bits, residual_bits);
+        const float residual_scale = tq_v_read_f16(residual_scale_base);
+        const float deq = levels <= 1u ? 0.0f : (-1.0f + 2.0f * float(q) / float(levels - 1u));
+        value += residual_scale * deq;
+    }
+
+    return value;
+}
+
+FLOAT_TYPEV4 tq_load_v4(uint row_index, uint d4) {
+    const uint el = d4 * 4u;
+    return FLOAT_TYPEV4(
+        tq_load_v_elem(row_index, el + 0u),
+        tq_load_v_elem(row_index, el + 1u),
+        tq_load_v_elem(row_index, el + 2u),
+        tq_load_v_elem(row_index, el + 3u)
+    );
+}
+#endif
 
 #ifdef MMQ
 #include "flash_attn_mmq_funcs.glsl"
@@ -181,8 +331,16 @@ void main() {
     uint32_t mo_offset = mo_stride * i;
 
     // FaBlockBytesK/V == 2 for f16, 16 for f32, ggml block byte size for quants.
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FaBlockBytesK;
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / FaBlockBytesV;
+#ifdef TURBOQUANT_K
+    uint32_t k_offset = 0;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
+#elif BLOCK_SIZE > 1
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / BLOCK_BYTE_SIZE;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
+#else
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
+#endif
     uint32_t m_offset = gqa_iq1*KV;
     if (p.nem2 != 1 || p.nem3 != 1) {
         m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
@@ -256,20 +414,22 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSK / 4 || c < Bc) {
                     FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
                     if (!KV_bounds_check || j * Bc + c < KV) {
-                        if (USE_DECODE_K) {
-                            uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE_K + 4 * d;
-                            uint ib = coord / BLOCK_SIZE_K;
-                            uint iqs = (coord % BLOCK_SIZE_K);
-                            K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
-                        } else {
-                            K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
-                        }
+#ifdef TURBOQUANT_K
+                        K_Tf = tq_load_k4(j * Bc + c, d);
+#elif BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE + 4 * d;
+                        uint ib = coord / BLOCK_SIZE;
+                        uint iqs = (coord % BLOCK_SIZE);
+                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+#else
+                        K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
+#endif
                     }
 
                     kvsh[c * kvsh_stride + d] = K_Tf;
                 }
             }
-#else // MMQ
+#else // MMQ <-- TODO(miguel): does TQ implementation changes in case of MMQ?
             const uint ints_per_block = 8u / fa_quant_r_mmq(FaTypeK);
             const uint quant_iters = Bc * HSK / 32 * ints_per_block;
             [[unroll]] for (uint32_t idx = 0; idx < quant_iters; idx += gl_WorkGroupSize.x) {
@@ -309,13 +469,17 @@ void main() {
                     FLOAT_TYPEV4 K_Tf;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
-                    } else if (USE_DECODE_K) {
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE_K + 4 * (d * D_split + d_tid);
-                        uint ib = coord / BLOCK_SIZE_K;
-                        uint iqs = (coord % BLOCK_SIZE_K);
-                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
                     } else {
+#ifdef TURBOQUANT_K
+                        K_Tf = tq_load_k4(j * Bc + c * cols_per_iter + col_tid, d * D_split + d_tid);
+#elif BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / BLOCK_SIZE;
+                        uint iqs = (coord % BLOCK_SIZE);
+                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+#else
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
+#endif
                     }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                         Sf[r][c] += dot(ACC_TYPEV4(Q_cache[r]), ACC_TYPEV4(K_Tf));
@@ -332,14 +496,17 @@ void main() {
                     FLOAT_TYPEV4 K_Tf;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
-                    } else if (USE_DECODE_K) {
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE_K + 4 * (d * D_split + d_tid);
-                        uint ib = coord / BLOCK_SIZE_K;
-                        uint iqs = (coord % BLOCK_SIZE_K);
+                    } else if {
+#ifdef TURBOQUANT_K
+                        K_Tf = tq_load_k4(j * Bc + c * cols_per_iter + col_tid, d * D_split + d_tid);
+#elif BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / BLOCK_SIZE;
+                        uint iqs = (coord % BLOCK_SIZE);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
-                    } else {
+#else
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
-                    }
+#endif
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                         Sf[r][c] += dot(ACC_TYPEV4(Qf[tile_row(r) * qf_stride + d * D_split + d_tid]), ACC_TYPEV4(K_Tf));
                     }
@@ -486,14 +653,16 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
                     if (!KV_bounds_check || j * Bc + c < KV) {
-                        if (USE_DECODE_V) {
-                            uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
-                            uint ib = coord / BLOCK_SIZE_V;
-                            uint iqs = (coord % BLOCK_SIZE_V);
-                            V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-                        } else {
-                            V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
-                        }
+#ifdef TURBOQUANT_V
+                        V_Tf = tq_load_v4(j * Bc + c, d);
+#elif BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE + 4 * d;
+                        uint ib = coord / BLOCK_SIZE;
+                        uint iqs = (coord % BLOCK_SIZE);
+                        V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+#else
+                        V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
+#endif
                     }
 
                     kvsh[c * kvsh_stride + d] = V_Tf;
@@ -517,13 +686,17 @@ void main() {
                 FLOAT_TYPEV4 Vf;
                 if (SHMEM_STAGING != 0) {
                     Vf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
-                } else if (USE_DECODE_V) {
-                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE_V + 4 * (d * D_split + d_tid);
-                    uint ib = coord / BLOCK_SIZE_V;
-                    uint iqs = (coord % BLOCK_SIZE_V);
-                    Vf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
                 } else {
+#ifdef TURBOQUANT_V
+                    Vf = tq_load_v4(j * Bc + c * cols_per_iter + col_tid, d * D_split + d_tid);
+#elif BLOCK_SIZE > 1
+                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                    uint ib = coord / BLOCK_SIZE;
+                    uint iqs = (coord % BLOCK_SIZE);
+                    Vf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+#else
                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
+#endif
                 }
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                     Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
