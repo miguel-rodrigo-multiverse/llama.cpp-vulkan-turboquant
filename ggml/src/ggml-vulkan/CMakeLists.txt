@@ -148,7 +148,11 @@ if (Vulkan_FOUND)
 
     ExternalProject_Add(
         vulkan-shaders-gen
-        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders
+        PREFIX     "${CMAKE_BINARY_DIR}/vsg"
+        SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders"
+        BINARY_DIR "${CMAKE_BINARY_DIR}/vsg-build"
+        STAMP_DIR  "${CMAKE_BINARY_DIR}/vsg-stamp"
+        TMP_DIR    "${CMAKE_BINARY_DIR}/vsg-tmp"
         CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/$<CONFIG>
                    -DCMAKE_INSTALL_BINDIR=.
                    -DCMAKE_BUILD_TYPE=$<CONFIG>
