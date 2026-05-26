@@ -282,12 +282,9 @@ void main() {
 #ifdef TURBOQUANT_K
     uint32_t k_offset = 0;
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
-#elif BLOCK_SIZE > 1
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / BLOCK_BYTE_SIZE;
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
 #else
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FaBlockBytesK;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / FaBlockBytesV;
 #endif
     
     uint32_t m_offset = gqa_iq1*KV;

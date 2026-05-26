@@ -334,12 +334,9 @@ void main() {
 #ifdef TURBOQUANT_K
     uint32_t k_offset = 0;
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
-#elif BLOCK_SIZE > 1
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / BLOCK_BYTE_SIZE;
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
 #else
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FaBlockBytesK;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / FaBlockBytesV;
 #endif
     uint32_t m_offset = gqa_iq1*KV;
     if (p.nem2 != 1 || p.nem3 != 1) {
@@ -496,7 +493,7 @@ void main() {
                     FLOAT_TYPEV4 K_Tf;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
-                    } else if {
+                    } else {
 #ifdef TURBOQUANT_K
                         K_Tf = tq_load_k4(j * Bc + c * cols_per_iter + col_tid, d * D_split + d_tid);
 #elif BLOCK_SIZE > 1
@@ -507,6 +504,7 @@ void main() {
 #else
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
 #endif
+                    }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                         Sf[r][c] += dot(ACC_TYPEV4(Qf[tile_row(r) * qf_stride + d * D_split + d_tid]), ACC_TYPEV4(K_Tf));
                     }

@@ -7,9 +7,16 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_16bit_storage : require
 
+#define QUANT_K_F32 1
+#define QUANT_R_F32 1
+#define QUANT_K_F16 1
+#define QUANT_R_F16 1
+#define QUANT_K_BF16 1
+#define QUANT_R_BF16 1
+
 #if defined(DATA_A_F32)
-#define QUANT_K 1
-#define QUANT_R 1
+#define QUANT_K QUANT_K_F32
+#define QUANT_R QUANT_R_F32
 
 #if LOAD_VEC_A == 4
 #define A_TYPE vec4
@@ -21,8 +28,8 @@
 #endif
 
 #if defined(DATA_A_F16)
-#define QUANT_K 1
-#define QUANT_R 1
+#define QUANT_K QUANT_K_F16
+#define QUANT_R QUANT_R_F16
 
 #if LOAD_VEC_A == 4
 #define A_TYPE f16vec4
@@ -34,8 +41,8 @@
 #endif
 
 #if defined(DATA_A_BF16)
-#define QUANT_K 1
-#define QUANT_R 1
+#define QUANT_K QUANT_K_BF16
+#define QUANT_R QUANT_R_BF16
 
 #if LOAD_VEC_A == 4
 #define A_TYPE u16vec4
