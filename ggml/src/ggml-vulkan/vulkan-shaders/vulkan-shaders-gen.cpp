@@ -344,11 +344,7 @@ void string_to_spv_func(std::string name, std::string in_path, std::string out_p
     if (dep_file) {
         cmd.push_back("-MD");
         cmd.push_back("-MF");
-#ifdef _WIN32
-        cmd.push_back("\"" + target_cpp + ".d\"");
-#else
         cmd.push_back(target_cpp + ".d");
-#endif
     }
 
     #ifdef GGML_VULKAN_SHADER_DEBUG_INFO
@@ -649,6 +645,8 @@ void process_shaders() {
                 if (fp16) {
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
                 if (tname == "f16") {
+                    string_to_spv("flash_attn_f32_f16", "flash_attn_cm2.comp",
+                        merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, true, f16acc);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm2.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, true, f16acc);
                 } else {
@@ -659,6 +657,8 @@ void process_shaders() {
 #endif
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 if (tname == "f16") {
+                    string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
+                        merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm1.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
                     string_to_spv("flash_attn_f32_f16_turboquant_k_" + tname, "flash_attn_cm1.comp",
@@ -674,6 +674,12 @@ void process_shaders() {
                 }
 
                 if (tname == "f16") {
+                    string_to_spv("flash_attn_f32_f16", "flash_attn.comp",
+                        merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+                    string_to_spv("flash_attn_f32_f16", "flash_attn.comp",
+                        merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"MMQ", "1"}, {"FA_MMQ_MIXED", "1"}}), fp16, false, false, f16acc, "_int8");
+#endif
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
                     string_to_spv("flash_attn_f32_f16_turboquant_k_" + tname, "flash_attn.comp",
@@ -1031,6 +1037,10 @@ void process_shaders() {
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
+
+    string_to_spv("turboquant_materialize_f16", "turboquant_materialize.comp", {{"D_TYPE", "float16_t"}, {"DATA_D_F16", "1"}});
+    string_to_spv("turboquant_materialize_f32", "turboquant_materialize.comp", {{"D_TYPE", "float"}, {"DATA_D_F32", "1"}});
+    string_to_spv("turboquant_materialize_bf16", "turboquant_materialize.comp", {{"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}});
 
     for (auto &c : compiles) {
         c.wait();
