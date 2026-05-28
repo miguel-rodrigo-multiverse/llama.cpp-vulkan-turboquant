@@ -348,6 +348,12 @@ struct cmd_params {
     std::vector<bool>                no_host;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
+    std::vector<llama_kv_cache_codec> kv_cache_codec;
+    std::vector<llama_turboquant_runtime> turboquant_runtime;
+    std::vector<uint32_t>            turboquant_group_size;
+    std::vector<uint32_t>            turboquant_residual_bits;
+    std::vector<bool>                turboquant_qjl;
+    std::vector<bool>                turboquant_allow_fallback;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -392,6 +398,12 @@ static const cmd_params cmd_params_defaults = {
     /* no_host              */ { false },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
+    /* kv_cache_codec       */ { LLAMA_KV_CACHE_CODEC_NONE },
+    /* turboquant_runtime   */ { LLAMA_TURBOQUANT_RUNTIME_AUTO },
+    /* turboquant_group_size*/ { 64 },
+    /* turboquant_residual_bits*/ { 1 },
+    /* turboquant_qjl       */ { true },
+    /* turboquant_allow_fallback*/ { true },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -461,6 +473,12 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                              (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                (default: 0)\n");
     printf("  --no-host <0|1>                             (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
+    printf("  --kv-codec <none|turboquant>                (default: %s)\n", join(transform_to_str(cmd_params_defaults.kv_cache_codec, llama_kv_cache_codec_name), ",").c_str());
+    printf("  --kv-tq-runtime <auto|hip|vulkan>           (default: %s)\n", join(transform_to_str(cmd_params_defaults.turboquant_runtime, llama_turboquant_runtime_name), ",").c_str());
+    printf("  --kv-tq-group-size <n>                      (default: %s)\n", join(transform_to_str(cmd_params_defaults.turboquant_group_size, [](uint32_t v) { return std::to_string(v); }), ",").c_str());
+    printf("  --kv-tq-residual-bits <n>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.turboquant_residual_bits, [](uint32_t v) { return std::to_string(v); }), ",").c_str());
+    printf("  --kv-tq-qjl <0|1>                           (default: %s)\n", join(cmd_params_defaults.turboquant_qjl, ",").c_str());
+    printf("  --kv-tq-fallback <0|1>                      (default: %s)\n", join(cmd_params_defaults.turboquant_allow_fallback, ",").c_str());
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -495,6 +513,29 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     }
 
     return GGML_TYPE_COUNT;
+}
+
+static llama_kv_cache_codec kv_cache_codec_from_str(const std::string & s) {
+    if (s == "none") {
+        return LLAMA_KV_CACHE_CODEC_NONE;
+    }
+    if (s == "turboquant") {
+        return LLAMA_KV_CACHE_CODEC_TURBOQUANT;
+    }
+    throw std::invalid_argument("Unsupported KV cache codec: " + s);
+}
+
+static llama_turboquant_runtime turboquant_runtime_from_str(const std::string & s) {
+    if (s == "auto") {
+        return LLAMA_TURBOQUANT_RUNTIME_AUTO;
+    }
+    if (s == "hip") {
+        return LLAMA_TURBOQUANT_RUNTIME_HIP;
+    }
+    if (s == "vulkan") {
+        return LLAMA_TURBOQUANT_RUNTIME_VULKAN;
+    }
+    throw std::invalid_argument("Unsupported TurboQuant runtime: " + s);
 }
 
 static cmd_params parse_cmd_params(int argc, char ** argv) {
@@ -830,6 +871,96 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
+            } else if (arg == "--kv-codec") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                std::vector<llama_kv_cache_codec> codecs;
+                for (const auto & s : p) {
+                    try {
+                        codecs.push_back(kv_cache_codec_from_str(s));
+                    } catch (const std::exception & e) {
+                        fprintf(stderr, "error: %s\n", e.what());
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.kv_cache_codec.insert(params.kv_cache_codec.end(), codecs.begin(), codecs.end());
+            } else if (arg == "--kv-tq-runtime") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                std::vector<llama_turboquant_runtime> runtimes;
+                for (const auto & s : p) {
+                    try {
+                        runtimes.push_back(turboquant_runtime_from_str(s));
+                    } catch (const std::exception & e) {
+                        fprintf(stderr, "error: %s\n", e.what());
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.turboquant_runtime.insert(params.turboquant_runtime.end(), runtimes.begin(), runtimes.end());
+            } else if (arg == "--kv-tq-group-size") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                std::vector<uint32_t> sizes;
+                for (int val : p) {
+                    if (val < 0) {
+                        invalid_param = true;
+                        break;
+                    }
+                    sizes.push_back((uint32_t)val);
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.turboquant_group_size.insert(params.turboquant_group_size.end(), sizes.begin(), sizes.end());
+            } else if (arg == "--kv-tq-residual-bits") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                std::vector<uint32_t> bits;
+                for (int val : p) {
+                    if (val < 0) {
+                        invalid_param = true;
+                        break;
+                    }
+                    bits.push_back((uint32_t)val);
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.turboquant_residual_bits.insert(params.turboquant_residual_bits.end(), bits.begin(), bits.end());
+            } else if (arg == "--kv-tq-qjl") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.turboquant_qjl.insert(params.turboquant_qjl.end(), p.begin(), p.end());
+            } else if (arg == "--kv-tq-fallback") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.turboquant_allow_fallback.insert(params.turboquant_allow_fallback.end(), p.begin(), p.end());
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1116,6 +1247,24 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.fit_params_min_ctx.empty()) {
         params.fit_params_min_ctx = cmd_params_defaults.fit_params_min_ctx;
     }
+    if (params.kv_cache_codec.empty()) {
+        params.kv_cache_codec = cmd_params_defaults.kv_cache_codec;
+    }
+    if (params.turboquant_runtime.empty()) {
+        params.turboquant_runtime = cmd_params_defaults.turboquant_runtime;
+    }
+    if (params.turboquant_group_size.empty()) {
+        params.turboquant_group_size = cmd_params_defaults.turboquant_group_size;
+    }
+    if (params.turboquant_residual_bits.empty()) {
+        params.turboquant_residual_bits = cmd_params_defaults.turboquant_residual_bits;
+    }
+    if (params.turboquant_qjl.empty()) {
+        params.turboquant_qjl = cmd_params_defaults.turboquant_qjl;
+    }
+    if (params.turboquant_allow_fallback.empty()) {
+        params.turboquant_allow_fallback = cmd_params_defaults.turboquant_allow_fallback;
+    }
 
     return params;
 }
@@ -1149,6 +1298,12 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    llama_kv_cache_codec kv_cache_codec;
+    llama_turboquant_runtime turboquant_runtime;
+    uint32_t           turboquant_group_size;
+    uint32_t           turboquant_residual_bits;
+    bool               turboquant_qjl;
+    bool               turboquant_allow_fallback;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1226,6 +1381,12 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.kv_cache_codec            = kv_cache_codec;
+        cparams.turboquant_runtime        = turboquant_runtime;
+        cparams.turboquant_group_size     = turboquant_group_size;
+        cparams.turboquant_residual_bits  = turboquant_residual_bits;
+        cparams.turboquant_qjl            = turboquant_qjl;
+        cparams.turboquant_allow_fallback = turboquant_allow_fallback;
 
         return cparams;
     }
@@ -1255,6 +1416,12 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nub : params.n_ubatch)
     for (const auto & tk : params.type_k)
     for (const auto & tv : params.type_v)
+    for (const auto & kvc : params.kv_cache_codec)
+    for (const auto & tqr : params.turboquant_runtime)
+    for (const auto & tgs : params.turboquant_group_size)
+    for (const auto & trb : params.turboquant_residual_bits)
+    for (const auto & tqj : params.turboquant_qjl)
+    for (const auto & tqf : params.turboquant_allow_fallback)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
@@ -1295,6 +1462,12 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .kv_cache_codec            = */ kvc,
+                /* .turboquant_runtime        = */ tqr,
+                /* .turboquant_group_size     = */ tgs,
+                /* .turboquant_residual_bits  = */ trb,
+                /* .turboquant_qjl            = */ tqj,
+                /* .turboquant_allow_fallback = */ tqf,
             };
             instances.push_back(instance);
         }
@@ -1332,6 +1505,12 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .kv_cache_codec            = */ kvc,
+                /* .turboquant_runtime        = */ tqr,
+                /* .turboquant_group_size     = */ tgs,
+                /* .turboquant_residual_bits  = */ trb,
+                /* .turboquant_qjl            = */ tqj,
+                /* .turboquant_allow_fallback = */ tqf,
             };
             instances.push_back(instance);
         }
@@ -1369,6 +1548,12 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .kv_cache_codec            = */ kvc,
+                /* .turboquant_runtime        = */ tqr,
+                /* .turboquant_group_size     = */ tgs,
+                /* .turboquant_residual_bits  = */ trb,
+                /* .turboquant_qjl            = */ tqj,
+                /* .turboquant_allow_fallback = */ tqf,
             };
             instances.push_back(instance);
         }
@@ -1395,6 +1580,12 @@ struct test {
     int                      poll;
     ggml_type                type_k;
     ggml_type                type_v;
+    llama_kv_cache_codec     kv_cache_codec;
+    llama_turboquant_runtime turboquant_runtime;
+    uint32_t                 turboquant_group_size;
+    uint32_t                 turboquant_residual_bits;
+    bool                     turboquant_qjl;
+    bool                     turboquant_allow_fallback;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
     llama_split_mode         split_mode;
@@ -1435,6 +1626,12 @@ struct test {
         poll           = inst.poll;
         type_k         = inst.type_k;
         type_v         = inst.type_v;
+        kv_cache_codec = inst.kv_cache_codec;
+        turboquant_runtime = inst.turboquant_runtime;
+        turboquant_group_size = inst.turboquant_group_size;
+        turboquant_residual_bits = inst.turboquant_residual_bits;
+        turboquant_qjl = inst.turboquant_qjl;
+        turboquant_allow_fallback = inst.turboquant_allow_fallback;
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
         split_mode     = inst.split_mode;
@@ -1505,7 +1702,8 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "kv_cache_codec","turboquant_runtime", "turboquant_group_size", "turboquant_residual_bits", "turboquant_qjl", "turboquant_allow_fallback",
+            "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
@@ -1522,11 +1720,12 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "turboquant_group_size" || field == "turboquant_residual_bits") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
-            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
+            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host" ||
+            field == "turboquant_qjl" || field == "turboquant_allow_fallback") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1589,6 +1788,12 @@ struct test {
                                             std::to_string(poll),
                                             ggml_type_name(type_k),
                                             ggml_type_name(type_v),
+                                            llama_kv_cache_codec_name(kv_cache_codec),
+                                            llama_turboquant_runtime_name(turboquant_runtime),
+                                            std::to_string(turboquant_group_size),
+                                            std::to_string(turboquant_residual_bits),
+                                            std::to_string(turboquant_qjl),
+                                            std::to_string(turboquant_allow_fallback),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
                                             split_mode_str(split_mode),
@@ -1895,6 +2100,24 @@ struct markdown_printer : public printer {
         }
         if (params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v) {
             fields.emplace_back("type_v");
+        }
+        if (params.kv_cache_codec.size() > 1 || params.kv_cache_codec != cmd_params_defaults.kv_cache_codec) {
+            fields.emplace_back("kv_cache_codec");
+        }
+        if (params.turboquant_runtime.size() > 1 || params.turboquant_runtime != cmd_params_defaults.turboquant_runtime) {
+            fields.emplace_back("turboquant_runtime");
+        }
+        if (params.turboquant_group_size.size() > 1 || params.turboquant_group_size != cmd_params_defaults.turboquant_group_size) {
+            fields.emplace_back("turboquant_group_size");
+        }
+        if (params.turboquant_residual_bits.size() > 1 || params.turboquant_residual_bits != cmd_params_defaults.turboquant_residual_bits) {
+            fields.emplace_back("turboquant_residual_bits");
+        }
+        if (params.turboquant_qjl.size() > 1 || params.turboquant_qjl != cmd_params_defaults.turboquant_qjl) {
+            fields.emplace_back("turboquant_qjl");
+        }
+        if (params.turboquant_allow_fallback.size() > 1 || params.turboquant_allow_fallback != cmd_params_defaults.turboquant_allow_fallback) {
+            fields.emplace_back("turboquant_allow_fallback");
         }
         if (params.main_gpu.size() > 1 || params.main_gpu != cmd_params_defaults.main_gpu) {
             fields.emplace_back("main_gpu");
