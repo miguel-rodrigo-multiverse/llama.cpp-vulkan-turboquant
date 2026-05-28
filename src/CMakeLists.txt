@@ -35,6 +35,10 @@ add_library(llama
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp
+            llama-turboquant.cpp
+            llama-turboquant-codec.cpp
+            llama-turboquant-runtime.cpp
+            llama-turboquant-runtime-vulkan.cpp
             unicode-data.cpp
             unicode.cpp
             unicode.h

@@ -300,10 +300,14 @@ static bool llama_turboquant_runtime_materialize_device_upload(
     std::string native_reason;
     switch (runtime) {
         case LLAMA_TURBOQUANT_RUNTIME_HIP:
+#if defined(GGML_USE_HIP)
             if (llama_turboquant_runtime_materialize_native_hip(request, ctx, native_reason)) {
                 reason.clear();
                 return true;
             }
+#else
+            native_reason = "TurboQuant HIP native materialization is unavailable because this build does not include GGML HIP support";
+#endif
             break;
         case LLAMA_TURBOQUANT_RUNTIME_VULKAN:
             if (llama_turboquant_runtime_materialize_native_vulkan(request, ctx, native_reason)) {
