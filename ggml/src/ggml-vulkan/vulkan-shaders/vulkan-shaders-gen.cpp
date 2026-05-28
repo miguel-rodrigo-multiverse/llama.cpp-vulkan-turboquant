@@ -410,7 +410,7 @@ void string_to_spv(std::string name, const std::string& source, const std::map<s
 
     if (input_filepath == "") {
         // No input source to compile, only generate header for all shaders
-        shader_fnames.push_back(std::pair(name, out_path));
+        shader_fnames.push_back({name, out_path});
         return;
     } else if (basename(input_filepath) != source) {
         // Only compile shader variants matching the input filename

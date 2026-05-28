@@ -2781,10 +2781,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
             const size_t packed_row_size = llama_turboquant_row_size(n_embd_k_gqa, tq_params);
             std::vector<uint8_t> row_data(k_size_row);
+            std::vector<uint8_t> packed_row_data(packed_row_size);
 
             for (uint32_t i = 0; i < cell_count; ++i) {
+                io.read(packed_row_data.data(), packed_row_size);
                 llama_turboquant_unpack_row(
-                        static_cast<const uint8_t *>(io.read(packed_row_size)),
+                        packed_row_data.data(),
                         k->type,
                         n_embd_k_gqa,
                         tq_params,
@@ -2843,10 +2845,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
                 const size_t packed_row_size = llama_turboquant_row_size(n_embd_v_gqa, tq_params);
                 std::vector<uint8_t> row_data(v_size_row);
+                std::vector<uint8_t> packed_row_data(packed_row_size);
 
                 for (uint32_t i = 0; i < cell_count; ++i) {
+                    io.read(packed_row_data.data(), packed_row_size);
                     llama_turboquant_unpack_row(
-                            static_cast<const uint8_t *>(io.read(packed_row_size)),
+                            packed_row_data.data(),
                             v->type,
                             n_embd_v_gqa,
                             tq_params,
@@ -2918,10 +2922,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 }
 
                 const size_t packed_row_size = llama_turboquant_row_size(cell_count, tq_params);
+                std::vector<uint8_t> packed_row_data(packed_row_size);
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                     std::vector<uint8_t> row_data(cell_count * v_size_el);
+                    io.read(packed_row_data.data(), packed_row_size);
                     llama_turboquant_unpack_row(
-                            static_cast<const uint8_t *>(io.read(packed_row_size)),
+                            packed_row_data.data(),
                             v->type,
                             cell_count,
                             tq_params,

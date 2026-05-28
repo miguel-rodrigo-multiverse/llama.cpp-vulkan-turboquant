@@ -68,11 +68,7 @@ const char * llama_turboquant_runtime_name(enum llama_turboquant_runtime runtime
     GGML_ABORT("fatal error");
 }
 
-struct llama_device_memory_data {
-    int64_t total;
-    int64_t free;
-    llama_memory_breakdown_data mb;
-};
+
 
 static std::vector<llama_device_memory_data> llama_get_device_memory_data(
         const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
@@ -127,7 +123,7 @@ static std::vector<llama_device_memory_data> llama_get_device_memory_data(
             continue;
         }
         for (size_t i = 0; i < ret.size(); i++) {
-            if (model->devices[i] == dev) {
+            if (model->devices[i].dev == dev) {
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
@@ -138,7 +134,7 @@ static std::vector<llama_device_memory_data> llama_get_device_memory_data(
     for (size_t i = 0; i < ret.size(); i++) {
         size_t free;
         size_t total;
-        ggml_backend_dev_memory(model->devices[i], &free, &total);
+        ggml_backend_dev_memory(model->devices[i].dev, &free, &total);
 
         // devices can return 0 bytes for free and total memory if they do not
         // have any to report. in this case, we will use the host memory as a fallback
@@ -154,7 +150,10 @@ static std::vector<llama_device_memory_data> llama_get_device_memory_data(
         ret[i].total = total;
     }
 
-    devs           = model->devices;
+    devs.clear();
+    for (const auto & ld : model->devices) {
+        devs.push_back(ld.dev);
+    }
     hp_ngl         = model->hparams.n_layer;
     hp_n_ctx_train = model->hparams.n_ctx_train;
     hp_n_expert    = model->hparams.n_expert;
