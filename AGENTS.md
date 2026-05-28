@@ -1,11 +1,19 @@
-# Instructions for llama.cpp
+# Main goal of this project
+We want to be able to run llama.cpp on iGPUs from AMD and Intel laptops running Windows. For such a task, we will focus on the Vulkan backend.
 
-> [!IMPORTANT]
-> This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
->
-> Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
+We are using the code from https://github.com/jimliddle/turboquant-amd-vulkan.git. However, this repository is very strange. It's a fork from llama.cpp, but it does not preserve the history, like the author just copied and pasted some of the llama.cpp files into its own "source" directory in his repository.
 
-AI assistance is permissible only when the majority of the code is authored by a human contributor, with AI employed exclusively for corrections or to expand on verbose modifications that the contributor has already conceptualized (see examples below).
+For this reason, it is not easy to check what changes he made and which llama.cpp version he based his work on.
+
+We have the following leads:
+- [Changes vs Upstream](https://github.com/jimliddle/turboquant-amd-vulkan/blob/main/Docs/changes-vs-upstream.md) - Lists all of the files he changed. We believe this list to be very reliable.
+- Many of the changes present in the diff, are not related to TurboQuant at all. This is the biggest deal!! They are simply other updates of llama.cpp itself. On top of that, some changes related to TurboQuant may or may not be compatible with the ways things are done now in llama.cpp.
+- We run `F="CMakeLists.txt"; git diff --no-index "../../llama.cpp-vulkan-turboquant/src/$F" "./src/$F"` from the `/Users/miguel.rodrigo/Work/turboquant-experiments/jimliddle-fork/source` directory to check the changes. On that command, you need to change
+  - The name of the file
+  - The base directory. For example if the file is in both places under `ggml/src/ggml-vulkan/` then the command would be: `F="<file_name>"; git diff --no-index "../../llama.cpp-vulkan-turboquant/ggml/src/ggml-vulkan/$F" "./ggml/src/ggml-vulkan/$F"`
+- [How to run TurboQuant](https://github.com/jimliddle/turboquant-amd-vulkan/blob/main/Docs/turboquant-model-usage.md) - This explains which command line arguments are required for `llama-bench` or `llama-server`
+
+Finally, we don't care about merging these changes to upstream llama.cpp because it's all experimental. We want to see what happens and it's very likely that it will never be merged, based on the results we get.
 
 ---
 
