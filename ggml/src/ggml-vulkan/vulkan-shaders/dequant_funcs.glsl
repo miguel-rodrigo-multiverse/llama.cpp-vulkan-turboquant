@@ -441,7 +441,7 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #if defined(DATA_A_MXFP4)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
-    return vec2(kvalues_mxfp4[vui & 0xF], kvalues_mxfp4[vui >> 4]) * 0.5;
+    return vec2(kvalues_mxfp4_f[vui & 0xF], kvalues_mxfp4_f[vui >> 4]);
 }
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
     vec2 v0 = dequantize(ib, iqs, a_offset);
@@ -460,7 +460,7 @@ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint vui1 = uint(data_a[a_offset + ib].qs[sub * 8u + j + 1]);
     const uint qs0 = (vui0 >> shift) & 0xF;
     const uint qs1 = (vui1 >> shift) & 0xF;
-    return vec2(float(kvalues_mxfp4[qs0]), float(kvalues_mxfp4[qs1])) * d * 0.5;
+    return vec2(kvalues_mxfp4_f[qs0], kvalues_mxfp4_f[qs1]) * d;
 }
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
     const vec2 v0 = dequantize(ib, iqs, a_offset);

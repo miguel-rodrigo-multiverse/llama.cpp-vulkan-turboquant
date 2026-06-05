@@ -69,6 +69,15 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+// Optional fused-op operands. fuse0 holds either ADD_ID bias or stand-alone MUL scale,
+// fuse1 holds the MUL scale that follows ADD_ID. Reads are guarded by p.fusion_flags.
+layout (binding = 5) readonly buffer Fuse0 {float data_fuse0[];};
+layout (binding = 6) readonly buffer Fuse1 {float data_fuse1[];};
+
+#define MAT_VEC_FUSION_FLAGS_BIAS0  0x1u
+#define MAT_VEC_FUSION_FLAGS_BIAS1  0x2u
+#define MAT_VEC_FUSION_FLAGS_SCALE0 0x4u
+#define MAT_VEC_FUSION_FLAGS_SCALE1 0x8u
 #endif
 
 layout (push_constant) uniform parameter
@@ -89,6 +98,7 @@ layout (push_constant) uniform parameter
     uint nei1;
     uint nbi1;
     uint ne11;
+    uint fusion_flags;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -383,9 +393,21 @@ void main() {
                 if (row_i >= _ne1) break;
 
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
+                float row_scale = 1.0;
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0u) {
+                    row_scale *= data_fuse0[uint(row_idx.y) * p.nei0 + uint(row_idx.x)];
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0u) {
+                    row_scale *= data_fuse1[uint(row_idx.y) * p.nei0 + uint(row_idx.x)];
+                }
 
                 if (dr + cm_row * TM + store_r < p.M) {
-                    data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    float v = float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0u) {
+                        v += data_fuse0[expert_idx * p.stride_d + dr + cm_row * TM + store_r];
+                    }
+                    v *= row_scale;
+                    data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(v);
                 }
             }
             barrier();
@@ -438,15 +460,33 @@ void main() {
                 if (row_i >= _ne1) break;
 
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
+                // Per-row scale applies uniformly across cr; compute once
+                float row_scale = 1.0;
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0u) {
+                    row_scale *= data_fuse0[uint(row_idx.y) * p.nei0 + uint(row_idx.x)];
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0u) {
+                    row_scale *= data_fuse1[uint(row_idx.y) * p.nei0 + uint(row_idx.x)];
+                }
 #endif // MUL_MAT_ID
                 [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
                     const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
 #ifdef MUL_MAT_ID
                     if (dr_warp + 2 * cr < p.M) {
-                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x);
+                        float v = float(sums[sums_idx].x);
+                        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0u) {
+                            v += data_fuse0[expert_idx * p.stride_d + dr_warp + 2 * cr];
+                        }
+                        v *= row_scale;
+                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr] = D_TYPE(v);
                     }
                     if (dr_warp + 2 * cr + 1 < p.M) {
-                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y);
+                        float v = float(sums[sums_idx].y);
+                        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0u) {
+                            v += data_fuse0[expert_idx * p.stride_d + dr_warp + 2 * cr + 1];
+                        }
+                        v *= row_scale;
+                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(v);
                     }
 #else
                     if (dr_warp + 2 * cr < p.M && dc_warp + cc < p.N) {
