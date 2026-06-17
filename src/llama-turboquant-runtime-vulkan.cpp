@@ -162,3 +162,92 @@ bool llama_turboquant_runtime_sync_native_vulkan(
     return false;
 #endif
 }
+
+bool llama_turboquant_runtime_compress_native_vulkan(
+        const ggml_tensor * src_tensor,
+        ggml_tensor * dst_tensor,
+        uint32_t n_row_el,
+        uint32_t kv_size,
+        bool transposed,
+        uint32_t group_size,
+        uint32_t residual_bits,
+        bool qjl,
+        size_t packed_row_size,
+        const uint32_t * row_indices,
+        size_t n_rows,
+        std::string & reason) {
+#if defined(GGML_USE_VULKAN)
+    if (src_tensor == nullptr || dst_tensor == nullptr || row_indices == nullptr || n_rows == 0) {
+        reason = "TurboQuant Vulkan compress request has null parameters or empty row count";
+        return false;
+    }
+
+    ggml_backend_buffer_t buffer = dst_tensor->view_src ? dst_tensor->view_src->buffer : dst_tensor->buffer;
+    if (buffer == nullptr) {
+        reason = "TurboQuant Vulkan compress requires a destination tensor with a buffer";
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
+    if (buft == nullptr) {
+        reason = "TurboQuant Vulkan compress could not resolve buffer type";
+        return false;
+    }
+    ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+    if (device == nullptr) {
+        reason = "TurboQuant Vulkan compress could not resolve device from buffer";
+        return false;
+    }
+
+    ggml_backend_t backend = llama_turboquant_runtime_get_backend(device, reason);
+    if (backend == nullptr) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+    if (reg == nullptr) {
+        reason = "TurboQuant Vulkan compress could not resolve the Vulkan backend registry";
+        return false;
+    }
+
+    auto * fn = (llama_turboquant_backend_compress_fn)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_turboquant_compress");
+    if (fn == nullptr) {
+        reason = "TurboQuant Vulkan compress entry point is not exported by the Vulkan backend";
+        return false;
+    }
+
+    if (!fn(
+            backend,
+            src_tensor,
+            dst_tensor,
+            n_row_el,
+            kv_size,
+            transposed,
+            group_size,
+            residual_bits,
+            qjl,
+            packed_row_size,
+            row_indices,
+            n_rows)) {
+        reason = "TurboQuant Vulkan compress entry point reported failure";
+        return false;
+    }
+
+    reason.clear();
+    return true;
+#else
+    GGML_UNUSED(src_tensor);
+    GGML_UNUSED(dst_tensor);
+    GGML_UNUSED(n_row_el);
+    GGML_UNUSED(kv_size);
+    GGML_UNUSED(transposed);
+    GGML_UNUSED(group_size);
+    GGML_UNUSED(residual_bits);
+    GGML_UNUSED(qjl);
+    GGML_UNUSED(packed_row_size);
+    GGML_UNUSED(row_indices);
+    GGML_UNUSED(n_rows);
+    reason = "TurboQuant Vulkan compress is unavailable because this build does not include GGML Vulkan support";
+    return false;
+#endif
+}

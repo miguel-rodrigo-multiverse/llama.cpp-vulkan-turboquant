@@ -27,6 +27,26 @@ using ggml_backend_turboquant_materialize_fn = bool (*)(
         const uint32_t * row_indices,
         size_t n_rows);
 
+using ggml_backend_turboquant_compress_fn = bool (*)(
+        ggml_backend_t backend,
+        const ggml_tensor * src_tensor,
+        ggml_tensor * dst_tensor,
+        uint32_t n_row_el,
+        uint32_t kv_size,
+        bool transposed,
+        uint32_t group_size,
+        uint32_t residual_bits,
+        bool qjl,
+        size_t packed_row_size,
+        const uint32_t * row_indices,
+        size_t n_rows);
+
+using ggml_backend_turboquant_get_packed_rows_fn = bool (*)(
+        ggml_backend_t backend,
+        const ggml_tensor * tensor,
+        uint8_t * out_data,
+        size_t size);
+
 static void require(bool cond, const char * msg) {
     if (!cond) {
         std::fprintf(stderr, "test-turboquant-backend: %s\n", msg);
@@ -168,6 +188,117 @@ static void test_backend_materialize(ggml_backend_t backend, ggml_backend_reg_t 
     ggml_free(ctx);
 }
 
+static void test_backend_compress(ggml_backend_t backend, ggml_backend_reg_t reg, bool transposed) {
+    constexpr uint32_t kv_size = 8;
+    constexpr uint32_t n_row_el = 16;
+    const ggml_turboquant_codec_params params = {
+        /*.group_size    =*/ 8,
+        /*.residual_bits =*/ 2,
+        /*.qjl           =*/ true,
+    };
+
+    auto * fn_compress = (ggml_backend_turboquant_compress_fn)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_turboquant_compress");
+    auto * fn_get_packed = (ggml_backend_turboquant_get_packed_rows_fn)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_turboquant_get_packed_rows");
+    require(fn_compress != nullptr, "Vulkan TurboQuant compress entry point is not exported");
+    require(fn_get_packed != nullptr, "Vulkan TurboQuant get_packed_rows entry point is not exported");
+
+    ggml_init_params init_params = {
+        /*.mem_size   =*/ 32 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ctx = ggml_init(init_params);
+    require(ctx != nullptr, "failed to create ggml context");
+
+    ggml_backend_buffer_t src_buffer = nullptr;
+    ggml_tensor * src_tensor = make_backend_tensor(
+            ctx,
+            ggml_backend_get_default_buffer_type(backend),
+            src_buffer,
+            GGML_TYPE_F32,
+            transposed ? kv_size : n_row_el,
+            transposed ? n_row_el : kv_size);
+
+    ggml_backend_buffer_t dst_buffer = nullptr;
+    ggml_tensor * dst_tensor = make_backend_tensor(
+            ctx,
+            ggml_backend_get_default_buffer_type(backend),
+            dst_buffer,
+            GGML_TYPE_F32,
+            transposed ? kv_size : n_row_el,
+            transposed ? n_row_el : kv_size);
+
+    // Initialize source tensor with signal
+    std::vector<float> src_data(kv_size * n_row_el);
+    for (uint32_t r = 0; r < kv_size; ++r) {
+        const auto src_row = make_row(r, n_row_el);
+        for (uint32_t c = 0; c < n_row_el; ++c) {
+            if (transposed) {
+                src_data[r + c * kv_size] = src_row[c];
+            } else {
+                src_data[r * n_row_el + c] = src_row[c];
+            }
+        }
+    }
+    ggml_backend_tensor_set(src_tensor, src_data.data(), 0, src_data.size() * sizeof(float));
+
+    const std::vector<uint32_t> row_indices = { 1, 3, 6 };
+    const size_t packed_row_size = ggml_turboquant_row_size(n_row_el, params);
+
+    // Compute expected packed rows on CPU
+    std::vector<uint8_t> expected_packed_all(kv_size * packed_row_size, 0);
+    for (uint32_t r : row_indices) {
+        const auto src_row = make_row(r, n_row_el);
+        std::vector<uint8_t> packed_row;
+        ggml_turboquant_pack_row(src_row.data(), GGML_TYPE_F32, n_row_el, params, packed_row);
+        require(packed_row.size() == packed_row_size, "packed row size mismatch");
+        std::memcpy(expected_packed_all.data() + r * packed_row_size, packed_row.data(), packed_row_size);
+    }
+
+    // Run GPU compression
+    require(fn_compress(
+            backend,
+            src_tensor,
+            dst_tensor,
+            n_row_el,
+            kv_size,
+            transposed,
+            params.group_size,
+            params.residual_bits,
+            params.qjl,
+            packed_row_size,
+            row_indices.data(),
+            row_indices.size()), "backend compress call failed");
+
+    // Read back compressed data
+    std::vector<uint8_t> actual_packed_all(kv_size * packed_row_size, 0);
+    require(fn_get_packed(
+            backend,
+            dst_tensor,
+            actual_packed_all.data(),
+            actual_packed_all.size()), "failed to read back packed rows");
+
+    // Verify compressed rows
+    for (uint32_t r : row_indices) {
+        const uint8_t * exp_ptr = expected_packed_all.data() + r * packed_row_size;
+        const uint8_t * act_ptr = actual_packed_all.data() + r * packed_row_size;
+        for (size_t b = 0; b < packed_row_size; ++b) {
+            if (exp_ptr[b] != act_ptr[b]) {
+                std::fprintf(stderr, "test-turboquant-backend: row %u mismatch at byte %zu: expected 0x%02X, got 0x%02X\n",
+                             r, b, exp_ptr[b], act_ptr[b]);
+                require(false, "compressed byte mismatch");
+            }
+        }
+    }
+
+    ggml_backend_buffer_free(src_buffer);
+    ggml_backend_buffer_free(dst_buffer);
+    ggml_free(ctx);
+}
+
 int main() {
     ggml_backend_dev_t dev = find_vulkan_device();
     if (dev == nullptr) {
@@ -183,6 +314,9 @@ int main() {
 
     test_backend_materialize(backend, reg, false);
     test_backend_materialize(backend, reg, true);
+
+    test_backend_compress(backend, reg, false);
+    test_backend_compress(backend, reg, true);
 
     ggml_backend_free(backend);
 

@@ -235,8 +235,6 @@ private:
     struct turboquant_shadow_layer {
         size_t row_size_k = 0;
         size_t row_size_v = 0;
-        std::vector<std::vector<uint8_t>> k_rows;
-        std::vector<std::vector<uint8_t>> v_rows;
         std::vector<std::vector<uint8_t>> k_dirty;
         std::vector<std::vector<uint8_t>> v_dirty;
         std::vector<uint8_t> k_backend_seeded;
@@ -330,7 +328,7 @@ private:
     ggml_tensor * cpy_k_raw(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v_raw(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
 
-    void sync_turboquant_shadow(const slot_info & sinfo) const;
+    void compress_gpu(const slot_info & sinfo) const;
     bool sync_turboquant_shadow_backend(const slot_info & sinfo, uint32_t n_kv, bool do_k, bool do_v) const;
     void materialize_turboquant_shadow(const slot_info & sinfo, uint32_t n_kv, bool do_k, bool do_v) const;
 

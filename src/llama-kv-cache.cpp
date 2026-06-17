@@ -326,14 +326,12 @@ llama_kv_cache::llama_kv_cache(
             auto & shadow = turboquant_shadow_layers[i];
 
             shadow.row_size_k = llama_turboquant_row_size(layer.k->ne[0], tq_params);
-            shadow.k_rows.resize(n_stream, std::vector<uint8_t>(get_size() * shadow.row_size_k, 0));
             shadow.k_dirty.resize(n_stream, std::vector<uint8_t>(get_size(), 0));
             shadow.k_backend_seeded.resize(n_stream, 0);
 
             if (layer.v) {
                 const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
                 shadow.row_size_v = llama_turboquant_row_size(n_embd_v_gqa, tq_params);
-                shadow.v_rows.resize(n_stream, std::vector<uint8_t>(get_size() * shadow.row_size_v, 0));
                 shadow.v_dirty.resize(n_stream, std::vector<uint8_t>(get_size(), 0));
                 shadow.v_backend_seeded.resize(n_stream, 0);
             }
@@ -397,12 +395,6 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
         for (auto & shadow : turboquant_shadow_layers) {
-            for (auto & rows : shadow.k_rows) {
-                std::fill(rows.begin(), rows.end(), 0);
-            }
-            for (auto & rows : shadow.v_rows) {
-                std::fill(rows.begin(), rows.end(), 0);
-            }
             for (auto & dirty : shadow.k_dirty) {
                 std::fill(dirty.begin(), dirty.end(), 0);
             }
@@ -1316,30 +1308,10 @@ ggml_tensor * llama_kv_cache::get_v_raw(ggml_context * ctx, int32_t il, uint32_t
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
-    if (codec == LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
-        if (!sync_turboquant_shadow_backend(sinfo, n_kv, /*do_k=*/true, /*do_v=*/false)) {
-            if (!warned_turboquant_live_fallback) {
-                LLAMA_LOG_WARN("%s: TurboQuant live attention currently uses host-side reference materialization from the compressed shadow\n", __func__);
-                warned_turboquant_live_fallback = true;
-            }
-            materialize_turboquant_shadow(sinfo, n_kv, /*do_k=*/true, /*do_v=*/false);
-        }
-    }
-
     return get_k_raw(ctx, il, n_kv, sinfo);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
-    if (codec == LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
-        if (!sync_turboquant_shadow_backend(sinfo, n_kv, /*do_k=*/false, /*do_v=*/true)) {
-            if (!warned_turboquant_live_fallback) {
-                LLAMA_LOG_WARN("%s: TurboQuant live attention currently uses host-side reference materialization from the compressed shadow\n", __func__);
-                warned_turboquant_live_fallback = true;
-            }
-            materialize_turboquant_shadow(sinfo, n_kv, /*do_k=*/false, /*do_v=*/true);
-        }
-    }
-
     return get_v_raw(ctx, il, n_kv, sinfo);
 }
 
@@ -1452,7 +1424,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     return cpy_v_raw(ctx, v_cur, v_idxs, il, sinfo);
 }
 
-void llama_kv_cache::sync_turboquant_shadow(const slot_info & sinfo) const {
+void llama_kv_cache::compress_gpu(const slot_info & sinfo) const {
     if (codec != LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
         return;
     }
@@ -1461,53 +1433,64 @@ void llama_kv_cache::sync_turboquant_shadow(const slot_info & sinfo) const {
     uint64_t rows_k = 0;
     uint64_t rows_v = 0;
 
-    const llama_turboquant_codec_params tq_params = {
-        /*.group_size    =*/ turboquant_group_size,
-        /*.residual_bits =*/ turboquant_residual_bits,
-        /*.qjl           =*/ turboquant_qjl,
-    };
-
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         const auto & layer = layers[ikv];
         auto & shadow = turboquant_shadow_layers[ikv];
 
-        std::vector<uint8_t> row_k(ggml_row_size(layer.k->type, layer.k->ne[0]));
-        std::vector<uint8_t> row_v(layer.v ? ggml_row_size(layer.v->type, hparams.n_embd_v_gqa(layer.il)) : 0);
-        std::vector<uint8_t> packed;
-
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const uint32_t strm = sinfo.strm[s];
-            auto * k = layer.k_stream[strm];
+            if (sinfo.idxs[s].empty()) {
+                continue;
+            }
 
             for (uint32_t i = 0; i < sinfo.idxs[s].size(); ++i) {
                 const uint32_t idx = sinfo.idxs[s][i];
-                ggml_backend_tensor_get(k, row_k.data(), idx * row_k.size(), row_k.size());
-                llama_turboquant_pack_row(row_k.data(), k->type, layer.k->ne[0], tq_params, packed);
-                std::memcpy(shadow.k_rows[strm].data() + idx * shadow.row_size_k, packed.data(), packed.size());
                 shadow.k_dirty[strm][idx] = 1;
                 ++rows_k;
-
-                if (!layer.v) {
-                    continue;
+                if (layer.v) {
+                    shadow.v_dirty[strm][idx] = 1;
+                    ++rows_v;
                 }
+            }
 
+            // Compress K
+            auto * k = layer.k_stream[strm];
+            std::string reason;
+            if (!llama_turboquant_runtime_compress(
+                    k, // src_tensor
+                    k, // dst_tensor
+                    (uint32_t) layer.k->ne[0], // n_row_el
+                    get_size(), // kv_size
+                    false, // K is not transposed
+                    turboquant_group_size,
+                    turboquant_residual_bits,
+                    turboquant_qjl,
+                    shadow.row_size_k,
+                    sinfo.idxs[s].data(),
+                    sinfo.idxs[s].size(),
+                    reason)) {
+                LLAMA_LOG_WARN("%s: Failed GPU-side compression for K: %s\n", __func__, reason.c_str());
+            }
+
+            // Compress V
+            if (layer.v) {
                 auto * v = layer.v_stream[strm];
                 const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
-
-                if (!v_trans) {
-                    ggml_backend_tensor_get(v, row_v.data(), idx * row_v.size(), row_v.size());
-                } else {
-                    const size_t v_size_el = ggml_type_size(v->type);
-                    for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                        const size_t src_offset = (idx + j * get_size()) * v_size_el;
-                        ggml_backend_tensor_get(v, row_v.data() + j * v_size_el, src_offset, v_size_el);
-                    }
+                if (!llama_turboquant_runtime_compress(
+                        v, // src_tensor
+                        v, // dst_tensor
+                        n_embd_v_gqa, // n_row_el
+                        get_size(), // kv_size
+                        v_trans, // V transposed
+                        turboquant_group_size,
+                        turboquant_residual_bits,
+                        turboquant_qjl,
+                        shadow.row_size_v,
+                        sinfo.idxs[s].data(),
+                        sinfo.idxs[s].size(),
+                        reason)) {
+                    LLAMA_LOG_WARN("%s: Failed GPU-side compression for V: %s\n", __func__, reason.c_str());
                 }
-
-                llama_turboquant_pack_row(row_v.data(), v->type, n_embd_v_gqa, tq_params, packed);
-                std::memcpy(shadow.v_rows[strm].data() + idx * shadow.row_size_v, packed.data(), packed.size());
-                shadow.v_dirty[strm][idx] = 1;
-                ++rows_v;
             }
         }
     }
@@ -1517,209 +1500,6 @@ void llama_kv_cache::sync_turboquant_shadow(const slot_info & sinfo) const {
     tq_stats.sync_rows_k += rows_k;
     tq_stats.sync_rows_v += rows_v;
     tq_stats.sync_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-}
-
-void llama_kv_cache::materialize_turboquant_shadow(const slot_info & sinfo, uint32_t n_kv, bool do_k, bool do_v) const {
-    if (codec != LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
-        return;
-    }
-
-    const auto t0 = std::chrono::steady_clock::now();
-    uint64_t rows_k = 0;
-    uint64_t rows_v = 0;
-
-    const llama_turboquant_codec_params tq_params = {
-        /*.group_size    =*/ turboquant_group_size,
-        /*.residual_bits =*/ turboquant_residual_bits,
-        /*.qjl           =*/ turboquant_qjl,
-    };
-
-    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-        const auto & layer = layers[ikv];
-        auto & shadow = turboquant_shadow_layers[ikv];
-
-        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const uint32_t strm = sinfo.strm[s];
-
-            if (do_k) {
-                auto * k = layer.k_stream[strm];
-                llama_turboquant_runtime_request request = {
-                    /*.runtime      =*/ turboquant_runtime,
-                    /*.codec_params =*/ tq_params,
-                    /*.buffer       =*/ {
-                        /*.tensor      =*/ k,
-                        /*.type        =*/ k->type,
-                        /*.n_row_el    =*/ (uint32_t) layer.k->ne[0],
-                        /*.kv_size     =*/ get_size(),
-                        /*.transposed  =*/ false,
-                    },
-                    /*.rows         =*/ {},
-                };
-                request.rows.reserve(n_kv);
-                for (uint32_t i = 0; i < n_kv; ++i) {
-                    if (!shadow.k_dirty[strm][i]) {
-                        continue;
-                    }
-                    request.rows.push_back({
-                        /*.packed      =*/ shadow.k_rows[strm].data() + i * shadow.row_size_k,
-                        /*.packed_size =*/ shadow.row_size_k,
-                        /*.row_index   =*/ i,
-                    });
-                }
-
-                if (!request.rows.empty()) {
-                    rows_k += request.rows.size();
-                    std::string reason;
-                    if (!llama_turboquant_runtime_materialize(request, reason)) {
-                        LLAMA_LOG_WARN("%s: TurboQuant K runtime fallback: %s\n", __func__, reason.c_str());
-                        llama_turboquant_runtime_request cpu_request = request;
-                        cpu_request.runtime = LLAMA_TURBOQUANT_RUNTIME_AUTO;
-                        tq_stats.cpu_fallback_calls += 1;
-                        GGML_ASSERT(llama_turboquant_runtime_materialize(cpu_request, reason));
-                    } else {
-                        if (reason.find("using staged upload fallback") != std::string::npos) {
-                            tq_stats.staged_calls += 1;
-                        } else {
-                            tq_stats.native_calls += 1;
-                        }
-                    }
-                    for (const auto & row : request.rows) {
-                        shadow.k_dirty[strm][row.row_index] = 0;
-                    }
-                }
-            }
-
-            if (do_v && layer.v) {
-                auto * v = layer.v_stream[strm];
-                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
-                llama_turboquant_runtime_request request = {
-                    /*.runtime      =*/ turboquant_runtime,
-                    /*.codec_params =*/ tq_params,
-                    /*.buffer       =*/ {
-                        /*.tensor      =*/ v,
-                        /*.type        =*/ v->type,
-                        /*.n_row_el    =*/ n_embd_v_gqa,
-                        /*.kv_size     =*/ get_size(),
-                        /*.transposed  =*/ v_trans,
-                    },
-                    /*.rows         =*/ {},
-                };
-                request.rows.reserve(n_kv);
-                for (uint32_t i = 0; i < n_kv; ++i) {
-                    if (!shadow.v_dirty[strm][i]) {
-                        continue;
-                    }
-                    request.rows.push_back({
-                        /*.packed      =*/ shadow.v_rows[strm].data() + i * shadow.row_size_v,
-                        /*.packed_size =*/ shadow.row_size_v,
-                        /*.row_index   =*/ i,
-                    });
-                }
-
-                if (!request.rows.empty()) {
-                    rows_v += request.rows.size();
-                    std::string reason;
-                    if (!llama_turboquant_runtime_materialize(request, reason)) {
-                        LLAMA_LOG_WARN("%s: TurboQuant V runtime fallback: %s\n", __func__, reason.c_str());
-                        llama_turboquant_runtime_request cpu_request = request;
-                        cpu_request.runtime = LLAMA_TURBOQUANT_RUNTIME_AUTO;
-                        tq_stats.cpu_fallback_calls += 1;
-                        GGML_ASSERT(llama_turboquant_runtime_materialize(cpu_request, reason));
-                    } else {
-                        if (reason.find("using staged upload fallback") != std::string::npos) {
-                            tq_stats.staged_calls += 1;
-                        } else {
-                            tq_stats.native_calls += 1;
-                        }
-                    }
-                    for (const auto & row : request.rows) {
-                        shadow.v_dirty[strm][row.row_index] = 0;
-                    }
-                }
-            }
-        }
-    }
-
-    const auto t1 = std::chrono::steady_clock::now();
-    tq_stats.materialize_calls += 1;
-    tq_stats.materialize_rows_k += rows_k;
-    tq_stats.materialize_rows_v += rows_v;
-    tq_stats.materialize_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-}
-
-bool llama_kv_cache::sync_turboquant_shadow_backend(const slot_info & sinfo, uint32_t n_kv, bool do_k, bool do_v) const {
-    if (codec != LLAMA_KV_CACHE_CODEC_TURBOQUANT) {
-        return false;
-    }
-
-    const llama_turboquant_codec_params tq_params = {
-        /*.group_size    =*/ turboquant_group_size,
-        /*.residual_bits =*/ turboquant_residual_bits,
-        /*.qjl           =*/ turboquant_qjl,
-    };
-    bool any_attempted = false;
-    bool all_synced = true;
-
-    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-        const auto & layer = layers[ikv];
-        auto & shadow = turboquant_shadow_layers[ikv];
-
-        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const uint32_t strm = sinfo.strm[s];
-
-            auto sync_one = [&](ggml_tensor * tensor, uint32_t n_row_el, bool transposed, std::vector<uint8_t> & dirty, std::vector<uint8_t> & rows, std::vector<uint8_t> & seeded, size_t row_size) {
-                llama_turboquant_runtime_request request = {
-                    /*.runtime      =*/ turboquant_runtime,
-                    /*.codec_params =*/ tq_params,
-                    /*.buffer       =*/ {
-                        /*.tensor      =*/ tensor,
-                        /*.type        =*/ tensor->type,
-                        /*.n_row_el    =*/ n_row_el,
-                        /*.kv_size     =*/ get_size(),
-                        /*.transposed  =*/ transposed,
-                    },
-                    /*.rows         =*/ {},
-                };
-
-                request.rows.reserve(n_kv);
-                for (uint32_t i = 0; i < n_kv; ++i) {
-                    if (!dirty[i] && seeded[strm]) {
-                        continue;
-                    }
-                    request.rows.push_back({
-                        /*.packed      =*/ rows.data() + i * row_size,
-                        /*.packed_size =*/ row_size,
-                        /*.row_index   =*/ i,
-                    });
-                }
-
-                if (request.rows.empty()) {
-                    return;
-                }
-
-                any_attempted = true;
-                std::string reason;
-                if (llama_turboquant_runtime_sync_shadow(request, reason)) {
-                    for (const auto & row : request.rows) {
-                        dirty[row.row_index] = 0;
-                    }
-                    seeded[strm] = 1;
-                } else {
-                    all_synced = false;
-                }
-            };
-
-            if (do_k) {
-                sync_one(layer.k_stream[strm], (uint32_t) layer.k->ne[0], false, shadow.k_dirty[strm], shadow.k_rows[strm], shadow.k_backend_seeded, shadow.row_size_k);
-            }
-
-            if (do_v && layer.v) {
-                sync_one(layer.v_stream[strm], hparams.n_embd_v_gqa(layer.il), v_trans, shadow.v_dirty[strm], shadow.v_rows[strm], shadow.v_backend_seeded, shadow.row_size_v);
-            }
-        }
-    }
-
-    return !any_attempted || all_synced;
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -3100,10 +2880,10 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache_context::post_compute(llama_context * lctx) {
+    GGML_UNUSED(lctx);
     if (ubatches.empty()) {
         return;
     }
 
-    lctx->synchronize();
-    kv->sync_turboquant_shadow(sinfos[i_cur]);
+    kv->compress_gpu(sinfos[i_cur]);
 }

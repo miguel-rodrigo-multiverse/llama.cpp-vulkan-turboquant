@@ -1042,6 +1042,10 @@ void process_shaders() {
     string_to_spv("turboquant_materialize_f32", "turboquant_materialize.comp", {{"D_TYPE", "float"}, {"DATA_D_F32", "1"}});
     string_to_spv("turboquant_materialize_bf16", "turboquant_materialize.comp", {{"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}});
 
+    string_to_spv("turboquant_compress_f16", "turboquant_compress.comp", {{"S_TYPE", "float16_t"}, {"DATA_S_F16", "1"}});
+    string_to_spv("turboquant_compress_f32", "turboquant_compress.comp", {{"S_TYPE", "float"}, {"DATA_S_F32", "1"}});
+    string_to_spv("turboquant_compress_bf16", "turboquant_compress.comp", {{"S_TYPE", "uint16_t"}, {"DATA_S_BF16", "1"}});
+
     for (auto &c : compiles) {
         c.wait();
     }

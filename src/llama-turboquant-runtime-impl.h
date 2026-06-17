@@ -42,6 +42,20 @@ using llama_turboquant_backend_sync_fn = bool (*)(
         const uint32_t * row_indices,
         size_t n_rows);
 
+using llama_turboquant_backend_compress_fn = bool (*)(
+        ggml_backend_t backend,
+        const ggml_tensor * src_tensor,
+        ggml_tensor * dst_tensor,
+        uint32_t n_row_el,
+        uint32_t kv_size,
+        bool transposed,
+        uint32_t group_size,
+        uint32_t residual_bits,
+        bool qjl,
+        size_t packed_row_size,
+        const uint32_t * row_indices,
+        size_t n_rows);
+
 inline bool llama_turboquant_runtime_linearize_rows(
         const llama_turboquant_runtime_request & request,
         std::vector<uint8_t> & packed_rows,
@@ -128,4 +142,20 @@ bool llama_turboquant_runtime_materialize_native_vulkan(
 bool llama_turboquant_runtime_sync_native_vulkan(
         const llama_turboquant_runtime_request & request,
         const llama_turboquant_runtime_context & ctx,
+        std::string & reason);
+
+ggml_backend_t llama_turboquant_runtime_get_backend(ggml_backend_dev_t device, std::string & reason);
+
+bool llama_turboquant_runtime_compress_native_vulkan(
+        const ggml_tensor * src_tensor,
+        ggml_tensor * dst_tensor,
+        uint32_t n_row_el,
+        uint32_t kv_size,
+        bool transposed,
+        uint32_t group_size,
+        uint32_t residual_bits,
+        bool qjl,
+        size_t packed_row_size,
+        const uint32_t * row_indices,
+        size_t n_rows,
         std::string & reason);

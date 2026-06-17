@@ -20,7 +20,7 @@ struct llama_turboquant_runtime_scratch {
     std::vector<uint8_t> column_data;
 };
 
-static ggml_backend_t llama_turboquant_runtime_get_backend(ggml_backend_dev_t device, std::string & reason);
+static ggml_backend_t llama_turboquant_runtime_get_backend_impl(ggml_backend_dev_t device, std::string & reason);
 
 static ggml_backend_buffer_t llama_turboquant_runtime_tensor_buffer(const ggml_tensor * tensor) {
     return tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -132,7 +132,7 @@ static bool llama_turboquant_runtime_prepare_context(
         return true;
     }
 
-    ctx.backend = llama_turboquant_runtime_get_backend(ctx.device, reason);
+    ctx.backend = llama_turboquant_runtime_get_backend_impl(ctx.device, reason);
     return ctx.backend != nullptr;
 }
 
@@ -155,7 +155,7 @@ static ggml_backend_ptr llama_turboquant_runtime_init_backend(ggml_backend_dev_t
     return { backend, ggml_backend_free };
 }
 
-static ggml_backend_t llama_turboquant_runtime_get_backend(ggml_backend_dev_t device, std::string & reason) {
+static ggml_backend_t llama_turboquant_runtime_get_backend_impl(ggml_backend_dev_t device, std::string & reason) {
     static thread_local std::vector<llama_turboquant_runtime_backend_entry> cache;
 
     for (auto & entry : cache) {
@@ -425,3 +425,52 @@ bool llama_turboquant_runtime_sync_shadow(const llama_turboquant_runtime_request
             return false;
     }
 }
+
+bool llama_turboquant_runtime_compress(
+        const ggml_tensor * src_tensor,
+        ggml_tensor * dst_tensor,
+        uint32_t n_row_el,
+        uint32_t kv_size,
+        bool transposed,
+        uint32_t group_size,
+        uint32_t residual_bits,
+        bool qjl,
+        size_t packed_row_size,
+        const uint32_t * row_indices,
+        size_t n_rows,
+        std::string & reason) {
+#if defined(GGML_USE_VULKAN)
+    return llama_turboquant_runtime_compress_native_vulkan(
+            src_tensor,
+            dst_tensor,
+            n_row_el,
+            kv_size,
+            transposed,
+            group_size,
+            residual_bits,
+            qjl,
+            packed_row_size,
+            row_indices,
+            n_rows,
+            reason);
+#else
+    GGML_UNUSED(src_tensor);
+    GGML_UNUSED(dst_tensor);
+    GGML_UNUSED(n_row_el);
+    GGML_UNUSED(kv_size);
+    GGML_UNUSED(transposed);
+    GGML_UNUSED(group_size);
+    GGML_UNUSED(residual_bits);
+    GGML_UNUSED(qjl);
+    GGML_UNUSED(packed_row_size);
+    GGML_UNUSED(row_indices);
+    GGML_UNUSED(n_rows);
+    reason = "TurboQuant GPU-side compression is only supported on Vulkan currently";
+    return false;
+#endif
+}
+
+ggml_backend_t llama_turboquant_runtime_get_backend(ggml_backend_dev_t device, std::string & reason) {
+    return llama_turboquant_runtime_get_backend_impl(device, reason);
+}
+

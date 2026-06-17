@@ -1,0 +1,237 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+
+#include "types.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_row_el;
+    uint kv_size;
+    uint packed_row_size;
+    uint group_size;
+    uint residual_bits;
+    uint qjl;
+    uint transposed;
+} p;
+
+layout(binding = 0) readonly buffer Src {
+    S_TYPE data_s[];
+};
+
+layout(binding = 1) readonly buffer RowIndices {
+    uint row_indices[];
+};
+
+layout(binding = 2) writeonly buffer PackedRows {
+    uint8_t packed_rows[];
+};
+
+float tq_load(uint index) {
+#if defined(DATA_S_F16)
+    return float(data_s[index]);
+#elif defined(DATA_S_F32)
+    return data_s[index];
+#elif defined(DATA_S_BF16)
+    return bf16_to_fp32(uint32_t(data_s[index]));
+#else
+#error unsupported TurboQuant source type
+#endif
+}
+
+void tq_write_byte(uint byte_offset, uint8_t val) {
+    packed_rows[byte_offset] = val;
+}
+
+void tq_write_u16(uint byte_offset, uint val) {
+    packed_rows[byte_offset + 0u] = uint8_t(val & 0xffu);
+    packed_rows[byte_offset + 1u] = uint8_t((val >> 8u) & 0xffu);
+}
+
+void tq_write_u32(uint byte_offset, uint val) {
+    packed_rows[byte_offset + 0u] = uint8_t(val & 0xffu);
+    packed_rows[byte_offset + 1u] = uint8_t((val >> 8u) & 0xffu);
+    packed_rows[byte_offset + 2u] = uint8_t((val >> 16u) & 0xffu);
+    packed_rows[byte_offset + 3u] = uint8_t((val >> 24u) & 0xffu);
+}
+
+shared float sh_values[64];
+shared float sh_abs_values[64];
+shared float sh_residuals[64];
+shared uint  sh_packed_signs[2];
+shared uint  sh_packed_residuals[4];
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+    const uint row_slot = gl_WorkGroupID.y;
+    const uint group_index = gl_WorkGroupID.x;
+
+    const uint row_index = row_indices[row_slot];
+    const uint group_start = group_index * p.group_size;
+    const uint group_el = min(p.group_size, p.n_row_el - group_start);
+
+    // Initialize shared memory
+    sh_values[t] = 0.0;
+    sh_abs_values[t] = 0.0;
+    sh_residuals[t] = 0.0;
+    if (t < 2) {
+        sh_packed_signs[t] = 0;
+    }
+    if (t < 4) {
+        sh_packed_residuals[t] = 0;
+    }
+    barrier();
+
+    // 1. Load Data
+    float val = 0.0;
+    if (t < group_el) {
+        const uint el = group_start + t;
+        const uint src_index = p.transposed != 0u
+                ? row_index + el * p.kv_size
+                : row_index * p.n_row_el + el;
+        val = tq_load(src_index);
+    }
+    sh_values[t] = val;
+    sh_abs_values[t] = abs(val);
+    barrier();
+
+    // 2. Parallel reduction to find primary scale
+    for (uint stride = 32; stride > 0; stride >>= 1) {
+        if (t < stride) {
+            sh_abs_values[t] = max(sh_abs_values[t], sh_abs_values[t + stride]);
+        }
+        barrier();
+    }
+    float primary_scale = sh_abs_values[0];
+    barrier();
+
+    // 3. Pack signs
+    bool positive = (val >= 0.0);
+    uint sign_bit = positive ? 1u : 0u;
+
+    // Use a temporary shared memory array for bit packing
+    shared uint sh_temp_bits[64];
+    sh_temp_bits[t] = sign_bit;
+    barrier();
+
+    if (t == 0) {
+        uint w = 0;
+        for (int i = 0; i < 32; ++i) {
+            w |= sh_temp_bits[i] << i;
+        }
+        sh_packed_signs[0] = w;
+    } else if (t == 32) {
+        uint w = 0;
+        for (int i = 0; i < 32; ++i) {
+            w |= sh_temp_bits[32 + i] << i;
+        }
+        sh_packed_signs[1] = w;
+    }
+    barrier();
+
+    // 4. Calculate residuals
+    float reconstructed = positive ? primary_scale : -primary_scale;
+    float residual = val - reconstructed;
+    sh_residuals[t] = residual;
+    sh_abs_values[t] = abs(residual);
+    barrier();
+
+    // 5. Parallel reduction to find residual scale
+    for (uint stride = 32; stride > 0; stride >>= 1) {
+        if (t < stride) {
+            sh_abs_values[t] = max(sh_abs_values[t], sh_abs_values[t + stride]);
+        }
+        barrier();
+    }
+    float residual_scale = sh_abs_values[0];
+    barrier();
+
+    // 6. Pack residuals (if residual_bits > 0)
+    if (p.qjl != 0 && p.residual_bits > 0) {
+        float norm = residual_scale > 0.0 ? residual / residual_scale : 0.0;
+        float clamped = clamp(norm, -1.0, 1.0);
+        uint levels = 1u << p.residual_bits;
+        float qf = (levels <= 1u) ? 0.0f : ((clamped + 1.0f) * 0.5f * float(levels - 1u));
+        uint q = (levels <= 1u) ? 0u : uint(round(qf));
+
+        sh_temp_bits[t] = q;
+        barrier();
+
+        if (p.residual_bits == 1) {
+            if (t == 0) {
+                uint w = 0;
+                for (int i = 0; i < 32; ++i) {
+                    w |= sh_temp_bits[i] << i;
+                }
+                sh_packed_residuals[0] = w;
+            } else if (t == 32) {
+                uint w = 0;
+                for (int i = 0; i < 32; ++i) {
+                    w |= sh_temp_bits[32 + i] << i;
+                }
+                sh_packed_residuals[1] = w;
+            }
+        } else if (p.residual_bits == 2) {
+            if (t == 0) {
+                uint w = 0;
+                for (int i = 0; i < 16; ++i) {
+                    w |= (sh_temp_bits[i] & 3u) << (i * 2u);
+                }
+                sh_packed_residuals[0] = w;
+            } else if (t == 16) {
+                uint w = 0;
+                for (int i = 0; i < 16; ++i) {
+                    w |= (sh_temp_bits[16 + i] & 3u) << (i * 2u);
+                }
+                sh_packed_residuals[1] = w;
+            } else if (t == 32) {
+                uint w = 0;
+                for (int i = 0; i < 16; ++i) {
+                    w |= (sh_temp_bits[32 + i] & 3u) << (i * 2u);
+                }
+                sh_packed_residuals[2] = w;
+            } else if (t == 48) {
+                uint w = 0;
+                for (int i = 0; i < 16; ++i) {
+                    w |= (sh_temp_bits[48 + i] & 3u) << (i * 2u);
+                }
+                sh_packed_residuals[3] = w;
+            }
+        }
+        barrier();
+    }
+
+    // 7. Write packed layout to global memory (only thread 0)
+    if (t == 0) {
+        const uint full_sign_bytes = (p.group_size + 7u) >> 3u;
+        const uint full_residual_bytes = (p.group_size * p.residual_bits + 7u) >> 3u;
+        const uint full_group_bytes = 2u + full_sign_bytes + ((p.qjl != 0u && p.residual_bits > 0u) ? (2u + full_residual_bytes) : 0u);
+
+        const uint byte_offset = row_index * p.packed_row_size + group_index * full_group_bytes;
+
+        const uint primary_scale_f16 = packHalf2x16(vec2(primary_scale, 0.0));
+        const uint signs_w0 = sh_packed_signs[0];
+        const uint signs_w1 = sh_packed_signs[1];
+
+        // Scale (2 bytes) + signs (8 bytes)
+        tq_write_u16(byte_offset + 0u, primary_scale_f16);
+        tq_write_u32(byte_offset + 2u, signs_w0);
+        tq_write_u32(byte_offset + 6u, signs_w1);
+
+        if (p.qjl != 0 && p.residual_bits > 0) {
+            const uint residual_scale_f16 = packHalf2x16(vec2(residual_scale, 0.0));
+            tq_write_u16(byte_offset + 10u, residual_scale_f16);
+
+            if (p.residual_bits == 1) {
+                tq_write_u32(byte_offset + 12u, sh_packed_residuals[0]);
+                tq_write_u32(byte_offset + 16u, sh_packed_residuals[1]);
+            } else if (p.residual_bits == 2) {
+                tq_write_u32(byte_offset + 12u, sh_packed_residuals[0]);
+                tq_write_u32(byte_offset + 16u, sh_packed_residuals[1]);
+                tq_write_u32(byte_offset + 20u, sh_packed_residuals[2]);
+                tq_write_u32(byte_offset + 24u, sh_packed_residuals[3]);
+            }
+        }
+    }
+}
