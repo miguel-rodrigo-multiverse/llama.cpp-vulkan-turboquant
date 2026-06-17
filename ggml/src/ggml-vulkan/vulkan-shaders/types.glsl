@@ -1762,6 +1762,9 @@ const int8_t kvalues_mxfp4_const[16] = {
 };
 
 shared int8_t kvalues_mxfp4[16];
+// Pre-scaled float LUT for FP-dequant paths: kvalues_mxfp4_f[i] = float(kvalues_mxfp4_const[i]) * 0.5
+// The MMQ (integer dot) path keeps using the int8 LUT and folds the 0.5 into the per-block scale.
+shared float kvalues_mxfp4_f[16];
 
 #if defined(DATA_A_NVFP4)
 // UE4M3 scale in NVFP4 blocks use only 7 bits; sign (bit 7) is always zero.
@@ -1787,6 +1790,7 @@ void init_iq_shmem(uvec3 wgsize)
     // copy the table into shared memory and sync
     for (uint i = gl_LocalInvocationIndex.x; i < kvalues_mxfp4.length(); i += wgsize.x) {
         kvalues_mxfp4[i] = kvalues_mxfp4_const[i];
+        kvalues_mxfp4_f[i] = float(kvalues_mxfp4_const[i]) * 0.5;
     }
 #if defined(DATA_A_NVFP4)
     for (uint i = gl_LocalInvocationIndex.x; i < 128u; i += wgsize.x) {

@@ -52,6 +52,9 @@ layout (push_constant) uniform parameter
     uint nei1;
     uint nbi1;
     uint ne11;
+    // bit-field flagging fused MUL_MAT_ID + ADD_ID / MUL epilogues (unused in this shader,
+    // declared to keep push_constant offsets in sync with vk_mat_mat_id_push_constants)
+    uint fusion_flags;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -95,6 +98,10 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+// Bindings 5,6: fused-op operands. Unused in cm2 (fusion is gated off for coopmat2 in
+// ggml_vk_can_fuse) but declared so the descriptor set layout matches the non-cm2 path.
+layout (binding = 5) readonly buffer Fuse0 {float data_fuse0[];};
+layout (binding = 6) readonly buffer Fuse1 {float data_fuse1[];};
 
 shared u16vec4 row_ids[BN];
 

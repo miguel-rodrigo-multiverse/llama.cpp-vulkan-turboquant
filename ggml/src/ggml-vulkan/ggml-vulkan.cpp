@@ -1142,6 +1142,7 @@ struct vk_mat_mat_id_push_constants {
     uint32_t nei1;
     uint32_t nbi1;
     uint32_t ne11;
+    uint32_t fusion_flags;
     uint32_t padded_N;
 };
 
@@ -3083,11 +3084,11 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device & device, size_t size) {
                 { vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                   vk::MemoryPropertyFlagBits::eDeviceLocal });
         } else if (device->uma) {
-            // Fall back to host memory type
             buf = ggml_vk_create_buffer(
                 device, size,
-                { vk::MemoryPropertyFlagBits::eDeviceLocal,
-                  vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent });
+                { vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                  vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                  vk::MemoryPropertyFlagBits::eDeviceLocal });
         } else if (device->disable_host_visible_vidmem) {
             if (device->allow_sysmem_fallback) {
                 buf = ggml_vk_create_buffer(
@@ -4298,7 +4299,7 @@ static void ggml_vk_load_shaders(vk_device & device) {
     }
 #endif
 
-    const int mul_mat_id_param_count = 5;
+    const int mul_mat_id_param_count = 7;
 
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     if (device->coopmat2) {
@@ -4381,59 +4382,36 @@ static void ggml_vk_load_shaders(vk_device & device) {
 
         GGML_ASSERT(device->subgroup_ballot);
 
-        CREATE_MM2(pipeline_matmul_id_f16, matmul_id_subgroup_f16, wg_denoms, warptile, vk_mat_mat_id_push_constants, 5)
-#    if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
+        CREATE_MM2(pipeline_matmul_id_f16, matmul_id_subgroup_f16, wg_denoms, warptile, vk_mat_mat_id_push_constants, 7)
+#if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
         if (device->coopmat_bf16_support) {
-            CREATE_MM(pipeline_matmul_id_bf16, matmul_id_subgroup_bf16, , wg_denoms, warptile,
-                      vk_mat_mat_id_push_constants, 5)
+            CREATE_MM(pipeline_matmul_id_bf16, matmul_id_subgroup_bf16, , wg_denoms, warptile, vk_mat_mat_id_push_constants, 7)
         }
-#    endif
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0], matmul_id_subgroup_q1_0_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_1], matmul_id_subgroup_q4_1_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_1], matmul_id_subgroup_q5_1_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_K], matmul_id_subgroup_q2_k_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_K], matmul_id_subgroup_q4_k_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_K], matmul_id_subgroup_q5_k_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ1_S], matmul_id_subgroup_iq1_s_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ1_M], matmul_id_subgroup_iq1_m_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_XXS], matmul_id_subgroup_iq2_xxs_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_XS], matmul_id_subgroup_iq2_xs_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_S], matmul_id_subgroup_iq2_s_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_XXS], matmul_id_subgroup_iq3_xxs_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_S], matmul_id_subgroup_iq3_s_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS], matmul_id_subgroup_iq4_xs_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL], matmul_id_subgroup_iq4_nl_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4], matmul_id_subgroup_mxfp4_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4], matmul_id_subgroup_nvfp4_f16, mmqid_wg_denoms,
-                   warptile_mmqid, vk_mat_mat_id_push_constants, 5)
-#    undef CREATE_MM
-#    undef CREATE_MM2
+#endif
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0], matmul_id_subgroup_q1_0_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_1], matmul_id_subgroup_q4_1_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_1], matmul_id_subgroup_q5_1_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_K], matmul_id_subgroup_q2_k_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_K], matmul_id_subgroup_q4_k_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_K], matmul_id_subgroup_q5_k_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ1_S],   matmul_id_subgroup_iq1_s_f16,   mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ1_M],   matmul_id_subgroup_iq1_m_f16,   mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_XXS], matmul_id_subgroup_iq2_xxs_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_XS],  matmul_id_subgroup_iq2_xs_f16,  mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_S],   matmul_id_subgroup_iq2_s_f16,   mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_XXS], matmul_id_subgroup_iq3_xxs_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_S],   matmul_id_subgroup_iq3_s_f16,   mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS],  matmul_id_subgroup_iq4_xs_f16,  mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL],  matmul_id_subgroup_iq4_nl_f16,  mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f16,   mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4],   matmul_id_subgroup_nvfp4_f16,   mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 7)
+#undef CREATE_MM
+#undef CREATE_MM2
     } else
 #endif  // defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -8960,6 +8938,20 @@ static bool ggml_vk_buffer_write_2d_async(vk_context   subctx,
         subctx->s->buffer->buf.copyBuffer(buf->buffer, dst->buffer, slices);
         return true;
     }
+
+    if (dst->device->uma &&
+        (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+        dst->ptr != nullptr) {
+        if (width == spitch && width == dpitch) {
+            deferred_memcpy((uint8_t *)dst->ptr + offset, src, width * height, &subctx->in_memcpys);
+        } else {
+            for (size_t i = 0; i < height; i++) {
+                deferred_memcpy((uint8_t *)dst->ptr + offset + i * dpitch, (const uint8_t *)src + i * spitch, width, &subctx->in_memcpys);
+            }
+        }
+        return true;
+    }
+
     VK_LOG_DEBUG("STAGING");
 
     if (!sync_staging) {
@@ -9100,6 +9092,20 @@ static bool ggml_vk_buffer_read_2d_async(vk_context  subctx,
 
         return true;
     }
+
+    if (src->device->uma &&
+        (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+        src->ptr != nullptr) {
+        if (width == spitch && width == dpitch) {
+            deferred_memcpy(dst, (const uint8_t *)src->ptr + offset, width * height, &subctx->out_memcpys);
+        } else {
+            for (size_t i = 0; i < height; i++) {
+                deferred_memcpy((uint8_t *)dst + i * dpitch, (const uint8_t *)src->ptr + offset + i * spitch, width, &subctx->out_memcpys);
+            }
+        }
+        return true;
+    }
+
     VK_LOG_DEBUG("STAGING");
 
     if (!sync_staging) {
@@ -9546,44 +9552,21 @@ static uint32_t ggml_vk_guess_matmul_id_pipeline_align(ggml_backend_vk_context *
     return ggml_vk_guess_matmul_id_pipeline(ctx, mmp, m, n, true, src0_type, src1_type)->align;
 }
 
-static void ggml_vk_matmul_id(ggml_backend_vk_context * ctx,
-                              vk_context &              subctx,
-                              vk_pipeline &             pipeline,
-                              vk_subbuffer &&           a,
-                              vk_subbuffer &&           b,
-                              vk_subbuffer &&           d,
-                              vk_subbuffer &&           ids,
-                              const vk_subbuffer &      expert_count_buf,
-                              uint32_t                  m,
-                              uint32_t                  n,
-                              uint32_t                  k,
-                              uint32_t                  stride_a,
-                              uint32_t                  stride_b,
-                              uint32_t                  stride_d,
-                              uint32_t                  batch_stride_a,
-                              uint32_t                  batch_stride_b,
-                              uint32_t                  batch_stride_d,
-                              uint32_t                  n_as,
-                              uint32_t                  nei0,
-                              uint32_t                  nei1,
-                              uint32_t                  nbi1,
-                              uint32_t                  ne11,
-                              uint32_t                  padded_n) {
-    VK_LOG_DEBUG("ggml_vk_matmul_id(a: ("
-                 << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", "
-                 << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size
-                 << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: ("
-                 << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size
-                 << "), " << "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a
-                 << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", "
-                 << "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b
-                 << ", batch_stride_d: " << batch_stride_d << ", " << "n_as: " << n_as << ", nei0: " << nei0
-                 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
-    const vk_mat_mat_id_push_constants pc = {
-        m,    n,    k,    stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-        nei0, nei1, nbi1, ne11,     padded_n
-    };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
+static void ggml_vk_matmul_id(
+        ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline& pipeline,
+        vk_subbuffer&& a, vk_subbuffer&& b, vk_subbuffer&& d, vk_subbuffer&& ids, const vk_subbuffer & expert_count_buf,
+        const vk_subbuffer & fuse0, const vk_subbuffer & fuse1,
+        uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
+        uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
+        uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
+        uint32_t padded_n, uint32_t fusion_flags) {
+    VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
+        "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
+        "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
+        "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ", fusion_flags: 0x" << std::hex << fusion_flags << std::dec << ")");
+    const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
+                                              nei0, nei1, nbi1, ne11, fusion_flags, padded_n };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fuse0, fuse1 }, pc, { m, nei1, n_as });
 }
 
 static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
@@ -10733,28 +10716,17 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context *  ctx,
     }
 }
 
-static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx,
-                                     vk_context &              subctx,
-                                     const ggml_tensor *       src0,
-                                     const ggml_tensor *       src1,
-                                     const ggml_tensor *       ids,
-                                     ggml_tensor *             dst) {
-    VK_LOG_DEBUG(
-        "ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type
-                                     << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2]
-                                     << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1]
-                                     << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
-        std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0]
-                  << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0="
-                  << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
-        std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0]
-                  << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0="
-                  << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
-        std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0]
-                  << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0="
-                  << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3] << "),)");
-    GGML_ASSERT(ggml_vk_dim01_contiguous(src1) || src1->type == GGML_TYPE_F32 ||
-                src1->type == GGML_TYPE_F16);  // NOLINT
+static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * src0 = cgraph->nodes[node_idx]->src[0];
+    const ggml_tensor * src1 = cgraph->nodes[node_idx]->src[1];
+    const ggml_tensor * ids  = cgraph->nodes[node_idx]->src[2];
+    // when fusion is active, the final destination is the last fused node's output
+    ggml_tensor * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+    VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
+    std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
+    std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
+    std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3] << "),)");
+    GGML_ASSERT(ggml_vk_dim01_contiguous(src1) || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);  // NOLINT
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
 
     const uint64_t ne00 = src0->ne[0];
@@ -11043,11 +11015,47 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx,
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
+    // Optional fused-op buffers (ADD_ID bias, MUL scale). Default to d_D so the
+    // pipeline always has 7 valid bindings; the shader only reads them when the
+    // corresponding fusion_flags bit is set.
+    vk_subbuffer d_D_sub = { d_D, d_buf_offset, d_sz };
+    vk_subbuffer d_F0 = d_D_sub;
+    vk_subbuffer d_F1 = d_D_sub;
+    uint32_t fusion_flags = 0;
+
+    if (ctx->num_additional_fused_ops > 0) {
+        const ggml_tensor * fused1 = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * bias_or_scale = fused1->src[1];
+
+        d_F0 = ggml_vk_tensor_subbuffer(ctx, bias_or_scale);
+
+        if (fused1->op == GGML_OP_MUL) {
+            fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE0;
+        } else {
+            GGML_ASSERT(fused1->op == GGML_OP_ADD_ID);
+            fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
+        }
+    }
+
+    if (ctx->num_additional_fused_ops > 1) {
+        const ggml_tensor * fused2 = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * scale = fused2->src[1];
+
+        d_F1 = ggml_vk_tensor_subbuffer(ctx, scale);
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
+    }
+
     // compute
-    ggml_vk_matmul_id(ctx, subctx, pipeline, { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
-                      { d_D, d_buf_offset, d_sz }, { d_ids, ids_buf_offset, ids_sz }, expert_count_buf, ne01, ne21,
-                      ne10, ne10, ne10, ne01, stride_batch_x, stride_batch_y, ne20 * ne21, n_as, nei0, nei1,
-                      nbi1 / ggml_type_size(ids->type), ne11, padded_n);  // NOLINT
+    ggml_vk_matmul_id(
+        ctx, subctx, pipeline,
+        { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
+        { d_D, d_buf_offset, d_sz }, { d_ids, ids_buf_offset, ids_sz }, expert_count_buf,
+        d_F0, d_F1,
+        ne01, ne21, ne10, ne10, ne10, ne01,
+        stride_batch_x, stride_batch_y, ne20*ne21,
+        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n,
+        fusion_flags
+    );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
         ctx->prealloc_x_need_sync = true;
@@ -11339,7 +11347,7 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context *  ctx,
     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
-        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst);
+        ggml_vk_mul_mat_id_q_f16(ctx, subctx, cgraph, node_idx);
     }
 }
 
@@ -17483,8 +17491,10 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context *     ctx,
         if (mmid != mul->src[0]) {
             return false;
         }
-        // mat-vec only
-        if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
+        // mat-mat fusion is implemented in mul_mm.comp / mul_mmq.comp only;
+        // the cm2 (NV cooperative_matrix2) path has not been extended yet.
+        const bool is_mat_vec = ggml_vk_use_mul_mat_vec_id(cgraph, node_idx);
+        if (!is_mat_vec && ctx->device->coopmat2) {
             return false;
         }
         // shaders assume the types match
@@ -17499,9 +17509,22 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context *     ctx,
         if (get_misalign_bytes(ctx, scale) != 0) {
             return false;
         }
-        // shader only indexes by expert index
-        if (scale->ne[0] != 1 || scale->ne[1] != mul->ne[1] || scale->ne[2] != 1 || scale->ne[3] != 1) {
+        // dim layout: scale must be [1, n_expert_used, ...].
+        // mat-vec: scale is broadcast across tokens (ne[2] == 1).
+        // mat-mat: scale is per-token (ne[2] == n_tokens) -- the common GPT-OSS shape.
+        if (scale->ne[0] != 1 ||
+            scale->ne[1] != mul->ne[1] ||
+            scale->ne[3] != 1) {
             return false;
+        }
+        if (is_mat_vec) {
+            if (scale->ne[2] != 1) {
+                return false;
+            }
+        } else {
+            if (scale->ne[2] != mul->ne[2]) {
+                return false;
+            }
         }
         return true;
     };
@@ -17516,8 +17539,9 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context *     ctx,
         if (mul != add->src[0]) {
             return false;
         }
-        // mat-vec only
-        if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
+        // mat-mat fusion is implemented in mul_mm.comp / mul_mmq.comp only;
+        // the cm2 (NV cooperative_matrix2) path has not been extended yet.
+        if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx) && ctx->device->coopmat2) {
             return false;
         }
         // shaders assume the types match

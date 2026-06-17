@@ -692,7 +692,7 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
     uint32_t qs = bl.block.qs[iqs];
     qs >>= shift;
     qs &= 0xF;
-    float16_t ret = float16_t(kvalues_mxfp4[qs] * d * 0.5);
+    float16_t ret = float16_t(kvalues_mxfp4_f[qs] * d);
     return ret;
 }
 #endif
@@ -711,7 +711,7 @@ float16_t dequantFuncNVFP4(const in decodeBufNVFP4 bl, const in uint blockCoords
     const float d = ue4m3_to_fp32(bl.block.d[sub]);
     uint qs = uint(bl.block.qs[iqs]);
     qs = (qs >> shift) & 0xF;
-    return float16_t(kvalues_mxfp4[qs] * d * 0.5);
+    return float16_t(kvalues_mxfp4_f[qs] * d);
 }
 #endif
 
